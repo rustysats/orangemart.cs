@@ -9,7 +9,7 @@ using Oxide.Core.Libraries;
 
 namespace Oxide.Plugins
 {
-    [Info("Orangemart", "saulteafarmer", "0.3.0")]
+    [Info("Orangemart", "RustySats", "0.3.0")]
     [Description("Allows players to buy and sell in-game units and VIP status using Bitcoin Lightning Network payments via LNbits")]
     public class Orangemart : CovalencePlugin
     {
@@ -101,13 +101,21 @@ namespace Oxide.Plugins
         }
 
         // Invoice and Payment Classes
-        private class InvoiceResponse
-        {
-            [JsonProperty("payment_request")]
-            public string PaymentRequest { get; set; }
+private class InvoiceResponse
+{
+    [JsonProperty("bolt11")]
+    public string PaymentRequest { get; set; }
 
-            [JsonProperty("payment_hash")]
-            public string PaymentHash { get; set; }
+    [JsonProperty("payment_hash")]
+    public string PaymentHash { get; set; }
+}
+
+
+        // NEW: Wrapper class for LNbits v1 responses
+        private class InvoiceResponseWrapper
+        {
+            [JsonProperty("data")]
+            public InvoiceResponse Data { get; set; }
         }
 
         private class SellInvoiceLogEntry
@@ -433,6 +441,45 @@ namespace Oxide.Plugins
 
             return allItems;
         }
+
+        private bool IsCurrencyItem(Item item)
+{
+    return item.info.itemid == currencyItemID && (currencySkinID == 0 || item.skin == currencySkinID);
+}
+
+private bool TryReserveCurrency(BasePlayer player, int amount)
+{
+    var items = GetAllInventoryItems(player).Where(IsCurrencyItem).ToList();
+    int totalCurrency = items.Sum(item => item.amount);
+
+    if (totalCurrency < amount)
+    {
+        return false;
+    }
+
+    int remaining = amount;
+
+    foreach (var item in items)
+    {
+        if (item.amount > remaining)
+        {
+            item.UseItem(remaining);
+            break;
+        }
+        else
+        {
+            remaining -= item.amount;
+            item.Remove();
+        }
+
+        if (remaining <= 0)
+        {
+            break;
+        }
+    }
+
+    return true;
+}
 
         private void CheckPendingInvoices()
         {
@@ -927,293 +974,122 @@ namespace Oxide.Plugins
             });
         }
 
-        private void SendPayment(string bolt11, int satsAmount, Action<bool, string> callback)
+        // UPDATED: SendPayment now deserializes using the wrapper class
+private void SendPayment(string bolt11, int satsAmount, Action<bool, string> callback)
+{
+    // For outbound payments, LNbits expects only "out" and "bolt11"
+    string url = $"{config.BaseUrl}/api/v1/payments";
+    var requestBody = new
+    {
+        @out = true,
+        bolt11 = bolt11
+    };
+    string jsonBody = JsonConvert.SerializeObject(requestBody);
+
+    var headers = new Dictionary<string, string>
+    {
+        { "X-Api-Key", config.ApiKey },
+        { "Content-Type", "application/json" }
+    };
+
+    MakeWebRequest(url, jsonBody, (code, response) =>
+    {
+        if (code != 200 && code != 201)
         {
-            string url = $"{config.BaseUrl}/api/v1/payments";
-            var requestBody = new
-            {
-                @out = true,
-                bolt11 = bolt11,
-                amount = satsAmount
-            };
-            string jsonBody = JsonConvert.SerializeObject(requestBody);
-
-            var headers = new Dictionary<string, string>
-            {
-                { "X-Api-Key", config.ApiKey },
-                { "Content-Type", "application/json" }
-            };
-
-            MakeWebRequest(url, jsonBody, (code, response) =>
-            {
-                if (code != 200 && code != 201)
-                {
-                    PrintError($"Error processing payment: HTTP {code}");
-                    callback(false, null);
-                    return;
-                }
-
-                try
-                {
-                    var paymentResponse = JsonConvert.DeserializeObject<Dictionary<string, object>>(response);
-                    string paymentHash = paymentResponse.ContainsKey("payment_hash") ? paymentResponse["payment_hash"].ToString() : null;
-
-                    if (!string.IsNullOrEmpty(paymentHash))
-                    {
-                        callback(true, paymentHash);
-                    }
-                    else
-                    {
-                        PrintError("Payment hash (rhash) is missing or invalid in the response.");
-                        callback(false, null);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    PrintError($"Exception occurred while parsing payment response: {ex.Message}");
-                    callback(false, null);
-                }
-            }, RequestMethod.POST, headers);
+            PrintError($"Error processing payment: HTTP {code}");
+            callback(false, null);
+            return;
         }
 
-        private void SendInvoiceToDiscord(IPlayer player, string invoice, int amountSats, string memo)
+        try
         {
-            if (string.IsNullOrEmpty(config.DiscordWebhookUrl))
+            InvoiceResponse invoiceResponse = null;
+            // First, attempt to deserialize using the wrapper (if present)
+            try
             {
-                PrintError("Discord webhook URL is not configured.");
-                return;
+                var wrapper = JsonConvert.DeserializeObject<InvoiceResponseWrapper>(response);
+                invoiceResponse = wrapper?.Data;
+            }
+            catch { }
+
+            // Fallback: try direct deserialization
+            if (invoiceResponse == null)
+            {
+                invoiceResponse = JsonConvert.DeserializeObject<InvoiceResponse>(response);
             }
 
-            string qrCodeUrl = $"https://api.qrserver.com/v1/create-qr-code/?data={Uri.EscapeDataString(invoice)}&size=200x200";
+            string paymentHash = invoiceResponse != null ? invoiceResponse.PaymentHash : null;
 
-            var webhookPayload = new
+            if (!string.IsNullOrEmpty(paymentHash))
             {
-                content = $"**{player.Name}**, please pay **{amountSats} sats** using the Lightning Network.",
-                embeds = new[]
-                {
-                    new
-                    {
-                        title = "Payment Invoice",
-                        description = $"{memo}\n\nPlease pay the following Lightning invoice to complete your purchase:\n\n```\n{invoice}\n```",
-                        image = new
-                        {
-                            url = qrCodeUrl
-                        },
-                        fields = new[]
-                        {
-                            new { name = "Amount", value = $"{amountSats} sats", inline = true },
-                            new { name = "Steam ID", value = GetPlayerId(player), inline = true }
-                        }
-                    }
-                }
-            };
-
-            string jsonPayload = JsonConvert.SerializeObject(webhookPayload);
-
-            MakeWebRequest(config.DiscordWebhookUrl, jsonPayload, (code, response) =>
-            {
-                if (code != 204)
-                {
-                    PrintError($"Failed to send invoice to Discord webhook: HTTP {code}");
-                }
-                else
-                {
-                    Puts($"Invoice sent to Discord for player {GetPlayerId(player)}.");
-                }
-            }, RequestMethod.POST, new Dictionary<string, string> { { "Content-Type", "application/json" } });
-        }
-
-        private void RewardPlayer(IPlayer player, int amount)
-        {
-            player.Reply($"You have successfully purchased {amount} {currencyName}!");
-
-            var basePlayer = player.Object as BasePlayer;
-
-            if (basePlayer != null)
-            {
-                var currencyItem = ItemManager.CreateByItemID(currencyItemID, amount);
-                if (currencyItem != null)
-                {
-                    if (currencySkinID > 0)
-                    {
-                        currencyItem.skin = currencySkinID;
-                    }
-
-                    basePlayer.GiveItem(currencyItem);
-                    Puts($"Gave {amount} {currencyName} (skinID: {currencySkinID}) to player {basePlayer.UserIDString}.");
-                }
-                else
-                {
-                    PrintError($"Failed to create {currencyName} item for player {basePlayer.UserIDString}.");
-                }
+                callback(true, paymentHash);
             }
             else
             {
-                PrintError($"Failed to find base player object for player {player.Id}.");
+                PrintError("Payment hash (rhash) is missing or invalid in the response.");
+                PrintWarning($"[SendPayment] Raw response: {response}");
+                callback(false, null);
             }
         }
-
-        private void GrantVip(IPlayer player)
+        catch (Exception ex)
         {
-            player.Reply("You have successfully purchased VIP status!");
+            PrintError($"Exception occurred while parsing payment response: {ex.Message}");
+            callback(false, null);
+        }
+    }, RequestMethod.POST, headers);
+}
 
-            permission.AddUserGroup(player.Id, vipPermissionGroup);
 
-            Puts($"Player {GetPlayerId(player)} added to VIP group '{vipPermissionGroup}'.");
+        // UPDATED: CreateInvoice now deserializes using the wrapper class
+private void CreateInvoice(int amountSats, string memo, Action<InvoiceResponse> callback)
+{
+    string url = $"{config.BaseUrl}/api/v1/payments";
+
+    var requestBody = new
+    {
+        @out = false,
+        amount = amountSats,
+        memo = memo
+    };
+    string jsonBody = JsonConvert.SerializeObject(requestBody);
+
+    var headers = new Dictionary<string, string>
+    {
+        { "X-Api-Key", config.ApiKey },
+        { "Content-Type", "application/json" }
+    };
+
+    MakeWebRequest(url, jsonBody, (code, response) =>
+    {
+        if (code != 200 && code != 201)
+        {
+            PrintError($"Error creating invoice: HTTP {code}");
+            callback(null);
+            return;
         }
 
-        private bool TryReserveCurrency(BasePlayer player, int amount)
+        if (string.IsNullOrEmpty(response))
         {
-            var items = GetAllInventoryItems(player).Where(IsCurrencyItem).ToList();
-            int totalCurrency = items.Sum(item => item.amount);
-
-            if (totalCurrency < amount)
-            {
-                return false;
-            }
-
-            int remaining = amount;
-
-            foreach (var item in items)
-            {
-                if (item.amount > remaining)
-                {
-                    item.UseItem(remaining);
-                    break;
-                }
-                else
-                {
-                    remaining -= item.amount;
-                    item.Remove();
-                }
-
-                if (remaining <= 0)
-                {
-                    break;
-                }
-            }
-
-            return true;
+            PrintError("Empty response received when creating invoice.");
+            callback(null);
+            return;
         }
 
-        private void ReturnCurrency(BasePlayer player, int amount)
+        // Log the raw response for debugging purposes.
+        PrintWarning($"[CreateInvoice] Raw response: {response}");
+
+        try
         {
-            var returnedCurrency = ItemManager.CreateByItemID(currencyItemID, amount);
-            if (returnedCurrency != null)
-            {
-                if (currencySkinID > 0)
-                {
-                    returnedCurrency.skin = currencySkinID;
-                }
-                returnedCurrency.MoveToContainer(player.inventory.containerMain);
-            }
-            else
-            {
-                PrintError($"Failed to create {currencyName} item to return to player {player.UserIDString}.");
-            }
+            var invoiceResponse = JsonConvert.DeserializeObject<InvoiceResponse>(response);
+            callback(invoiceResponse != null && !string.IsNullOrEmpty(invoiceResponse.PaymentHash) ? invoiceResponse : null);
         }
-
-        private bool IsCurrencyItem(Item item)
+        catch (Exception ex)
         {
-            return item.info.itemid == currencyItemID && (currencySkinID == 0 || item.skin == currencySkinID);
+            PrintError($"Failed to deserialize invoice response: {ex.Message}");
+            callback(null);
         }
-
-        private void LogSellTransaction(SellInvoiceLogEntry logEntry)
-        {
-            var logs = LoadSellLogData();
-            logs.Add(logEntry);
-            SaveSellLogData(logs);
-            Puts($"[Orangemart] Logged sell transaction: {JsonConvert.SerializeObject(logEntry)}");
-        }
-
-        private List<SellInvoiceLogEntry> LoadSellLogData()
-        {
-            var path = Path.Combine(Interface.Oxide.DataDirectory, SellLogFile);
-            return File.Exists(path)
-                ? JsonConvert.DeserializeObject<List<SellInvoiceLogEntry>>(File.ReadAllText(path))
-                : new List<SellInvoiceLogEntry>();
-        }
-
-        private void SaveSellLogData(List<SellInvoiceLogEntry> data)
-        {
-            var path = Path.Combine(Interface.Oxide.DataDirectory, SellLogFile);
-            var directory = Path.GetDirectoryName(path);
-            if (!Directory.Exists(directory))
-                Directory.CreateDirectory(directory);
-
-            File.WriteAllText(path, JsonConvert.SerializeObject(data, Formatting.Indented));
-        }
-
-        private void LogBuyInvoice(BuyInvoiceLogEntry logEntry)
-        {
-            var logPath = Path.Combine(Interface.Oxide.DataDirectory, BuyInvoiceLogFile);
-            var directory = Path.GetDirectoryName(logPath);
-            if (!Directory.Exists(directory))
-                Directory.CreateDirectory(directory);
-
-            List<BuyInvoiceLogEntry> invoiceLogs = File.Exists(logPath)
-                ? JsonConvert.DeserializeObject<List<BuyInvoiceLogEntry>>(File.ReadAllText(logPath)) ?? new List<BuyInvoiceLogEntry>()
-                : new List<BuyInvoiceLogEntry>();
-
-            invoiceLogs.Add(logEntry);
-            File.WriteAllText(logPath, JsonConvert.SerializeObject(invoiceLogs, Formatting.Indented));
-            Puts($"[Orangemart] Logged buy invoice: {JsonConvert.SerializeObject(logEntry)}");
-        }
-
-        private BuyInvoiceLogEntry CreateBuyInvoiceLogEntry(IPlayer player, string invoiceID, bool isPaid, int amount, PurchaseType type, int retryCount)
-        {
-            return new BuyInvoiceLogEntry
-            {
-                SteamID = GetPlayerId(player),
-                InvoiceID = invoiceID,
-                IsPaid = isPaid,
-                Timestamp = DateTime.UtcNow,
-                Amount = type == PurchaseType.SendBitcoin ? amount : amount * pricePerCurrencyUnit,
-                CurrencyGiven = isPaid && type == PurchaseType.Currency,
-                VipGranted = isPaid && type == PurchaseType.Vip,
-                RetryCount = retryCount
-            };
-        }
-
-        private void CreateInvoice(int amountSats, string memo, Action<InvoiceResponse> callback)
-        {
-            string url = $"{config.BaseUrl}/api/v1/payments";
-
-            var requestBody = new
-            {
-                @out = false,
-                amount = amountSats,
-                memo = memo
-            };
-            string jsonBody = JsonConvert.SerializeObject(requestBody);
-
-            var headers = new Dictionary<string, string>
-            {
-                { "X-Api-Key", config.ApiKey },
-                { "Content-Type", "application/json" }
-            };
-
-            MakeWebRequest(url, jsonBody, (code, response) =>
-            {
-                if (code != 200 && code != 201)
-                {
-                    PrintError($"Error creating invoice: HTTP {code}");
-                    callback(null);
-                    return;
-                }
-
-                try
-                {
-                    var invoiceResponse = JsonConvert.DeserializeObject<InvoiceResponse>(response);
-                    callback(invoiceResponse != null && !string.IsNullOrEmpty(invoiceResponse.PaymentHash) ? invoiceResponse : null);
-                }
-                catch (Exception ex)
-                {
-                    PrintError($"Failed to deserialize invoice response: {ex.Message}");
-                    callback(null);
-                }
-            }, RequestMethod.POST, headers);
-        }
+    }, RequestMethod.POST, headers);
+}
 
         private string GetPlayerId(IPlayer player)
         {
@@ -1356,10 +1232,170 @@ namespace Oxide.Plugins
 
         private string ExtractLightningAddress(string memo)
         {
-            // Extract the Lightning Address from the memo
             // Expected format: "Sending {amount} {currency} to {lightning_address}"
             var parts = memo.Split(" to ");
             return parts.Length == 2 ? parts[1] : "unknown@unknown.com";
+        }
+
+        // NEW: RewardPlayer method to grant currency items to the player
+        private void RewardPlayer(IPlayer player, int amount)
+        {
+            player.Reply($"You have successfully purchased {amount} {currencyName}!");
+
+            var basePlayer = player.Object as BasePlayer;
+            if (basePlayer != null)
+            {
+                var currencyItem = ItemManager.CreateByItemID(currencyItemID, amount);
+                if (currencyItem != null)
+                {
+                    if (currencySkinID > 0)
+                    {
+                        currencyItem.skin = currencySkinID;
+                    }
+                    basePlayer.GiveItem(currencyItem);
+                    Puts($"Gave {amount} {currencyName} (skinID: {currencySkinID}) to player {basePlayer.UserIDString}.");
+                }
+                else
+                {
+                    PrintError($"Failed to create {currencyName} item for player {basePlayer.UserIDString}.");
+                }
+            }
+            else
+            {
+                PrintError($"Failed to find base player object for player {player.Id}.");
+            }
+        }
+
+        // NEW: GrantVip method to add the VIP permission group to the player
+        private void GrantVip(IPlayer player)
+        {
+            player.Reply("You have successfully purchased VIP status!");
+            permission.AddUserGroup(player.Id, vipPermissionGroup);
+            Puts($"Player {GetPlayerId(player)} added to VIP group '{vipPermissionGroup}'.");
+        }
+
+        // NEW: ReturnCurrency method to refund currency items to the player
+        private void ReturnCurrency(BasePlayer player, int amount)
+        {
+            var returnedCurrency = ItemManager.CreateByItemID(currencyItemID, amount);
+            if (returnedCurrency != null)
+            {
+                if (currencySkinID > 0)
+                {
+                    returnedCurrency.skin = currencySkinID;
+                }
+                returnedCurrency.MoveToContainer(player.inventory.containerMain);
+            }
+            else
+            {
+                PrintError($"Failed to create {currencyName} item to return to player {player.UserIDString}.");
+            }
+        }
+
+        // NEW: LogSellTransaction helper
+        private void LogSellTransaction(SellInvoiceLogEntry logEntry)
+        {
+            var logs = LoadSellLogData();
+            logs.Add(logEntry);
+            SaveSellLogData(logs);
+            Puts($"[Orangemart] Logged sell transaction: {JsonConvert.SerializeObject(logEntry)}");
+        }
+
+        private List<SellInvoiceLogEntry> LoadSellLogData()
+        {
+            var path = Path.Combine(Interface.Oxide.DataDirectory, SellLogFile);
+            return File.Exists(path)
+                ? JsonConvert.DeserializeObject<List<SellInvoiceLogEntry>>(File.ReadAllText(path))
+                : new List<SellInvoiceLogEntry>();
+        }
+
+        private void SaveSellLogData(List<SellInvoiceLogEntry> data)
+        {
+            var path = Path.Combine(Interface.Oxide.DataDirectory, SellLogFile);
+            var directory = Path.GetDirectoryName(path);
+            if (!Directory.Exists(directory))
+                Directory.CreateDirectory(directory);
+
+            File.WriteAllText(path, JsonConvert.SerializeObject(data, Formatting.Indented));
+        }
+
+        // NEW: LogBuyInvoice helper
+        private void LogBuyInvoice(BuyInvoiceLogEntry logEntry)
+        {
+            var logPath = Path.Combine(Interface.Oxide.DataDirectory, BuyInvoiceLogFile);
+            var directory = Path.GetDirectoryName(logPath);
+            if (!Directory.Exists(directory))
+                Directory.CreateDirectory(directory);
+
+            List<BuyInvoiceLogEntry> invoiceLogs = File.Exists(logPath)
+                ? JsonConvert.DeserializeObject<List<BuyInvoiceLogEntry>>(File.ReadAllText(logPath)) ?? new List<BuyInvoiceLogEntry>()
+                : new List<BuyInvoiceLogEntry>();
+
+            invoiceLogs.Add(logEntry);
+            File.WriteAllText(logPath, JsonConvert.SerializeObject(invoiceLogs, Formatting.Indented));
+            Puts($"[Orangemart] Logged buy invoice: {JsonConvert.SerializeObject(logEntry)}");
+        }
+
+        private BuyInvoiceLogEntry CreateBuyInvoiceLogEntry(IPlayer player, string invoiceID, bool isPaid, int amount, PurchaseType type, int retryCount)
+        {
+            return new BuyInvoiceLogEntry
+            {
+                SteamID = GetPlayerId(player),
+                InvoiceID = invoiceID,
+                IsPaid = isPaid,
+                Timestamp = DateTime.UtcNow,
+                Amount = type == PurchaseType.SendBitcoin ? amount : amount * pricePerCurrencyUnit,
+                CurrencyGiven = isPaid && type == PurchaseType.Currency,
+                VipGranted = isPaid && type == PurchaseType.Vip,
+                RetryCount = retryCount
+            };
+        }
+
+        private void SendInvoiceToDiscord(IPlayer player, string invoice, int amountSats, string memo)
+        {
+            if (string.IsNullOrEmpty(config.DiscordWebhookUrl))
+            {
+                PrintError("Discord webhook URL is not configured.");
+                return;
+            }
+
+            string qrCodeUrl = $"https://api.qrserver.com/v1/create-qr-code/?data={Uri.EscapeDataString(invoice)}&size=200x200";
+
+            var webhookPayload = new
+            {
+                content = $"**{player.Name}**, please pay **{amountSats} sats** using the Lightning Network.",
+                embeds = new[]
+                {
+                    new
+                    {
+                        title = "Payment Invoice",
+                        description = $"{memo}\n\nPlease pay the following Lightning invoice to complete your purchase:\n\n```\n{invoice}\n```",
+                        image = new
+                        {
+                            url = qrCodeUrl
+                        },
+                        fields = new[]
+                        {
+                            new { name = "Amount", value = $"{amountSats} sats", inline = true },
+                            new { name = "Steam ID", value = GetPlayerId(player), inline = true }
+                        }
+                    }
+                }
+            };
+
+            string jsonPayload = JsonConvert.SerializeObject(webhookPayload);
+
+            MakeWebRequest(config.DiscordWebhookUrl, jsonPayload, (code, response) =>
+            {
+                if (code != 204)
+                {
+                    PrintError($"Failed to send invoice to Discord webhook: HTTP {code}");
+                }
+                else
+                {
+                    Puts($"Invoice sent to Discord for player {GetPlayerId(player)}.");
+                }
+            }, RequestMethod.POST, new Dictionary<string, string> { { "Content-Type", "application/json" } });
         }
     }
 }
