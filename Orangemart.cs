@@ -2,6 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net.WebSockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Oxide.Core;
 using Oxide.Core.Libraries.Covalence;
@@ -9,8 +13,8 @@ using Oxide.Core.Libraries;
 
 namespace Oxide.Plugins
 {
-    [Info("Orangemart", "RustySats", "0.3.0")]
-    [Description("Allows players to buy and sell in-game units and VIP status using Bitcoin Lightning Network payments via LNbits")]
+    [Info("Orangemart", "RustySats", "0.4.0")]
+    [Description("Allows players to buy and sell in-game units and VIP status using Bitcoin Lightning Network payments via LNbits with WebSocket support and comprehensive protection features")]
     public class Orangemart : CovalencePlugin
     {
         // Configuration sections and keys
@@ -36,6 +40,12 @@ namespace Oxide.Plugins
             public const string CurrencySkinID = "CurrencySkinID";
             public const string PricePerCurrencyUnit = "PricePerCurrencyUnit";
             public const string SatsPerCurrencyUnit = "SatsPerCurrencyUnit";
+            
+            // NEW: Protection Settings
+            public const string MaxPurchaseAmount = "MaxPurchaseAmount";
+            public const string MaxSendAmount = "MaxSendAmount";
+            public const string CommandCooldownSeconds = "CommandCooldownSeconds";
+            public const string MaxPendingInvoicesPerPlayer = "MaxPendingInvoicesPerPlayer";
 
             // Discord
             public const string DiscordChannelName = "DiscordChannelName";
@@ -49,10 +59,12 @@ namespace Oxide.Plugins
             public const string LNbitsApiKey = "LNbitsApiKey";
             public const string LNbitsBaseUrl = "LNbitsBaseUrl";
             public const string MaxRetries = "MaxRetries";
+            public const string UseWebSockets = "UseWebSockets";
+            public const string WebSocketReconnectDelay = "WebSocketReconnectDelay";
 
             // VIPSettings
-            public const string VipPermissionGroup = "VipPermissionGroup";
             public const string VipPrice = "VipPrice";
+            public const string VipCommand = "VipCommand";
         }
 
         // Configuration variables
@@ -61,7 +73,7 @@ namespace Oxide.Plugins
         private string sendCurrencyCommandName;
         private string buyVipCommandName;
         private int vipPrice;
-        private string vipPermissionGroup;
+        private string vipCommand;
         private string currencyName;
         private int satsPerCurrencyUnit;
         private int pricePerCurrencyUnit;
@@ -70,13 +82,96 @@ namespace Oxide.Plugins
         private int checkIntervalSeconds;
         private int invoiceTimeoutSeconds;
         private int maxRetries;
+        private bool useWebSockets;
+        private int webSocketReconnectDelay;
         private List<string> blacklistedDomains = new List<string>();
         private List<string> whitelistedDomains = new List<string>();
+        
+        // NEW: Protection and rate limiting variables
+        private int maxPurchaseAmount;
+        private int maxSendAmount;
+        private int commandCooldownSeconds;
+        private int maxPendingInvoicesPerPlayer;
+        private Dictionary<string, DateTime> lastCommandTime = new Dictionary<string, DateTime>();
+
         private const string SellLogFile = "Orangemart/send_bitcoin.json";
         private const string BuyInvoiceLogFile = "Orangemart/buy_invoices.json";
         private LNbitsConfig config;
         private List<PendingInvoice> pendingInvoices = new List<PendingInvoice>();
         private Dictionary<string, int> retryCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        
+        // WebSocket tracking
+        private Dictionary<string, WebSocketConnection> activeWebSockets = new Dictionary<string, WebSocketConnection>();
+        private readonly object webSocketLock = new object();
+
+        // Transaction status constants
+        private static class TransactionStatus
+        {
+            public const string INITIATED = "INITIATED";
+            public const string PROCESSING = "PROCESSING";
+            public const string COMPLETED = "COMPLETED";
+            public const string FAILED = "FAILED";
+            public const string EXPIRED = "EXPIRED";
+            public const string REFUNDED = "REFUNDED";
+        }
+
+        // WebSocket connection wrapper
+        private class WebSocketConnection
+        {
+            public ClientWebSocket WebSocket { get; set; }
+            public CancellationTokenSource CancellationTokenSource { get; set; }
+            public string InvoiceKey { get; set; }
+            public PendingInvoice Invoice { get; set; }
+            public DateTime ConnectedAt { get; set; }
+            public int ReconnectAttempts { get; set; }
+            public Task ListenTask { get; set; }
+        }
+
+        // WebSocket response structure
+        private class WebSocketPaymentUpdate
+        {
+            [JsonProperty("balance")]
+            public long Balance { get; set; }
+            
+            [JsonProperty("payment")]
+            public WebSocketPayment Payment { get; set; }
+        }
+
+        private class WebSocketPayment
+        {
+            [JsonProperty("checking_id")]
+            public string CheckingId { get; set; }
+            
+            [JsonProperty("pending")]
+            public bool Pending { get; set; }
+            
+            [JsonProperty("amount")]
+            public long Amount { get; set; }
+            
+            [JsonProperty("fee")]
+            public long Fee { get; set; }
+            
+            [JsonProperty("memo")]
+            public string Memo { get; set; }
+            
+            [JsonProperty("time")]
+            public long Time { get; set; }
+            
+            [JsonProperty("bolt11")]
+            public string Bolt11 { get; set; }
+            
+            [JsonProperty("preimage")]
+            public string Preimage { get; set; }
+            
+            [JsonProperty("payment_hash")]
+            public string PaymentHash { get; set; }
+            
+            [JsonProperty("expiry")]
+            public long Expiry { get; set; }
+            
+            [JsonProperty("extra")]
+            public Dictionary<string, object> Extra { get; set; }
+        }
 
         // LNbits Configuration
         private class LNbitsConfig
@@ -84,6 +179,7 @@ namespace Oxide.Plugins
             public string BaseUrl { get; set; }
             public string ApiKey { get; set; }
             public string DiscordWebhookUrl { get; set; }
+            public string WebSocketUrl { get; set; }
 
             public static LNbitsConfig ParseLNbitsConnection(string baseUrl, string apiKey, string discordWebhookUrl)
             {
@@ -91,59 +187,73 @@ namespace Oxide.Plugins
                 if (!Uri.IsWellFormedUriString(trimmedBaseUrl, UriKind.Absolute))
                     throw new Exception("Invalid base URL in connection string.");
 
+                // Convert HTTP URL to WebSocket URL
+                var wsUrl = trimmedBaseUrl.Replace("https://", "wss://").Replace("http://", "ws://");
+
                 return new LNbitsConfig
                 {
                     BaseUrl = trimmedBaseUrl,
                     ApiKey = apiKey,
-                    DiscordWebhookUrl = discordWebhookUrl
+                    DiscordWebhookUrl = discordWebhookUrl,
+                    WebSocketUrl = wsUrl
                 };
             }
         }
 
         // Invoice and Payment Classes
-private class InvoiceResponse
-{
-    [JsonProperty("bolt11")]
-    public string PaymentRequest { get; set; }
+        private class InvoiceResponse
+        {
+            [JsonProperty("bolt11")]
+            public string PaymentRequest { get; set; }
 
-    [JsonProperty("payment_hash")]
-    public string PaymentHash { get; set; }
-}
+            [JsonProperty("payment_hash")]
+            public string PaymentHash { get; set; }
+        }
 
-
-        // NEW: Wrapper class for LNbits v1 responses
+        // Wrapper class for LNbits v1 responses
         private class InvoiceResponseWrapper
         {
             [JsonProperty("data")]
             public InvoiceResponse Data { get; set; }
         }
 
+        // Enhanced SellInvoiceLogEntry with status tracking
         private class SellInvoiceLogEntry
         {
+            public string TransactionId { get; set; }
             public string SteamID { get; set; }
             public string LightningAddress { get; set; }
+            public string Status { get; set; }
             public bool Success { get; set; }
             public int SatsAmount { get; set; }
             public string PaymentHash { get; set; }
             public bool CurrencyReturned { get; set; }
             public DateTime Timestamp { get; set; }
+            public DateTime? CompletedTimestamp { get; set; }
             public int RetryCount { get; set; }
+            public string FailureReason { get; set; }
         }
 
+        // Enhanced BuyInvoiceLogEntry with status tracking
         private class BuyInvoiceLogEntry
         {
+            public string TransactionId { get; set; }
             public string SteamID { get; set; }
             public string InvoiceID { get; set; }
+            public string Status { get; set; }
             public bool IsPaid { get; set; }
             public DateTime Timestamp { get; set; }
+            public DateTime? CompletedTimestamp { get; set; }
             public int Amount { get; set; }
             public bool CurrencyGiven { get; set; }
             public bool VipGranted { get; set; }
             public int RetryCount { get; set; }
+            public string PurchaseType { get; set; }
         }
 
         private class PendingInvoice
         {
+            public string TransactionId { get; set; }
             public string RHash { get; set; }
             public IPlayer Player { get; set; }
             public int Amount { get; set; }
@@ -189,6 +299,18 @@ private class InvoiceResponse
                 pricePerCurrencyUnit = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.PricePerCurrencyUnit, 1, ref configChanged);
                 currencySkinID = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.CurrencySkinID, 0UL, ref configChanged);
 
+                // NEW: Parse Protection Settings
+                maxPurchaseAmount = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.MaxPurchaseAmount, 10000, ref configChanged);
+                maxSendAmount = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.MaxSendAmount, 10000, ref configChanged);
+                commandCooldownSeconds = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.CommandCooldownSeconds, 0, ref configChanged);
+                maxPendingInvoicesPerPlayer = GetConfigValue(ConfigSections.CurrencySettings, ConfigKeys.MaxPendingInvoicesPerPlayer, 1, ref configChanged);
+
+                // Ensure non-negative values
+                if (maxPurchaseAmount < 0) maxPurchaseAmount = 0;
+                if (maxSendAmount < 0) maxSendAmount = 0;
+                if (commandCooldownSeconds < 0) commandCooldownSeconds = 0;
+                if (maxPendingInvoicesPerPlayer < 0) maxPendingInvoicesPerPlayer = 0;
+
                 // Parse Command Names
                 buyCurrencyCommandName = GetConfigValue(ConfigSections.Commands, ConfigKeys.BuyCurrencyCommandName, "buyblood", ref configChanged);
                 sendCurrencyCommandName = GetConfigValue(ConfigSections.Commands, ConfigKeys.SendCurrencyCommandName, "sendblood", ref configChanged);
@@ -196,7 +318,7 @@ private class InvoiceResponse
 
                 // Parse VIP Settings
                 vipPrice = GetConfigValue(ConfigSections.VIPSettings, ConfigKeys.VipPrice, 1000, ref configChanged);
-                vipPermissionGroup = GetConfigValue(ConfigSections.VIPSettings, ConfigKeys.VipPermissionGroup, "vip", ref configChanged);
+                vipCommand = GetConfigValue(ConfigSections.VIPSettings, ConfigKeys.VipCommand, "oxide.usergroup add {player} vip", ref configChanged);
 
                 // Parse Discord Settings
                 discordChannelName = GetConfigValue(ConfigSections.Discord, ConfigKeys.DiscordChannelName, "mart", ref configChanged);
@@ -205,6 +327,8 @@ private class InvoiceResponse
                 checkIntervalSeconds = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.CheckIntervalSeconds, 10, ref configChanged);
                 invoiceTimeoutSeconds = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.InvoiceTimeoutSeconds, 300, ref configChanged);
                 maxRetries = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.MaxRetries, 25, ref configChanged);
+                useWebSockets = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.UseWebSockets, true, ref configChanged);
+                webSocketReconnectDelay = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.WebSocketReconnectDelay, 5, ref configChanged);
 
                 blacklistedDomains = GetConfigValue(ConfigSections.InvoiceSettings, ConfigKeys.BlacklistedDomains, new List<string> { "example.com", "blacklisted.net" }, ref configChanged)
                     .Select(d => d.ToLower()).ToList();
@@ -218,6 +342,9 @@ private class InvoiceResponse
                 {
                     SaveConfig();
                 }
+
+                // Log protection settings
+                Puts($"Protection Settings: MaxPurchase={maxPurchaseAmount}, MaxSend={maxSendAmount}, Cooldown={commandCooldownSeconds}s, MaxPending={maxPendingInvoicesPerPlayer}");
             }
             catch (Exception ex)
             {
@@ -242,9 +369,84 @@ private class InvoiceResponse
                 configChanged = true;
             }
 
+            if (!invoiceSettings.ContainsKey(ConfigKeys.UseWebSockets))
+            {
+                invoiceSettings[ConfigKeys.UseWebSockets] = true;
+                configChanged = true;
+            }
+
+            if (!invoiceSettings.ContainsKey(ConfigKeys.WebSocketReconnectDelay))
+            {
+                invoiceSettings[ConfigKeys.WebSocketReconnectDelay] = 5;
+                configChanged = true;
+            }
+
+            // Migrate VIP settings from old format to new format
+            if (!(Config[ConfigSections.VIPSettings] is Dictionary<string, object> vipSettings))
+            {
+                vipSettings = new Dictionary<string, object>();
+                Config[ConfigSections.VIPSettings] = vipSettings;
+                configChanged = true;
+            }
+
+            // Check if old VipPermissionGroup exists and migrate to VipCommand
+            if (vipSettings.ContainsKey("VipPermissionGroup") && !vipSettings.ContainsKey(ConfigKeys.VipCommand))
+            {
+                string oldGroup = vipSettings["VipPermissionGroup"].ToString();
+                vipSettings[ConfigKeys.VipCommand] = $"oxide.usergroup add {{player}} {oldGroup}";
+                vipSettings.Remove("VipPermissionGroup");
+                configChanged = true;
+                Puts($"[Migration] Converted VipPermissionGroup '{oldGroup}' to VipCommand");
+            }
+
+            // Ensure VipCommand exists with default value
+            if (!vipSettings.ContainsKey(ConfigKeys.VipCommand))
+            {
+                vipSettings[ConfigKeys.VipCommand] = "oxide.usergroup add {player} vip";
+                configChanged = true;
+            }
+
+            // NEW: Migrate protection settings
+            if (!(Config[ConfigSections.CurrencySettings] is Dictionary<string, object> currencySettings))
+            {
+                currencySettings = new Dictionary<string, object>();
+                Config[ConfigSections.CurrencySettings] = currencySettings;
+                configChanged = true;
+            }
+
+            // Add new protection settings if missing
+            if (!currencySettings.ContainsKey(ConfigKeys.MaxPurchaseAmount))
+            {
+                currencySettings[ConfigKeys.MaxPurchaseAmount] = 10000;
+                configChanged = true;
+                Puts("[Migration] Added MaxPurchaseAmount = 10000");
+            }
+
+            if (!currencySettings.ContainsKey(ConfigKeys.MaxSendAmount))
+            {
+                currencySettings[ConfigKeys.MaxSendAmount] = 10000;
+                configChanged = true;
+                Puts("[Migration] Added MaxSendAmount = 10000");
+            }
+
+            if (!currencySettings.ContainsKey(ConfigKeys.CommandCooldownSeconds))
+            {
+                currencySettings[ConfigKeys.CommandCooldownSeconds] = 0;
+                configChanged = true;
+                Puts("[Migration] Added CommandCooldownSeconds = 0 (disabled)");
+            }
+
+            if (!currencySettings.ContainsKey(ConfigKeys.MaxPendingInvoicesPerPlayer))
+            {
+                currencySettings[ConfigKeys.MaxPendingInvoicesPerPlayer] = 1;
+                configChanged = true;
+                Puts("[Migration] Added MaxPendingInvoicesPerPlayer = 1");
+            }
+
             if (configChanged)
             {
                 SaveConfig();
+                Puts("[Migration] Configuration updated with protection settings");
             }
         }
 
@@ -332,7 +534,12 @@ private class InvoiceResponse
                 [ConfigKeys.CurrencyName] = "blood",
                 [ConfigKeys.CurrencySkinID] = 0UL,
                 [ConfigKeys.PricePerCurrencyUnit] = 1,
-                [ConfigKeys.SatsPerCurrencyUnit] = 1
+                [ConfigKeys.SatsPerCurrencyUnit] = 1,
+                // NEW: Protection settings
+                [ConfigKeys.MaxPurchaseAmount] = 10000,
+                [ConfigKeys.MaxSendAmount] = 10000,
+                [ConfigKeys.CommandCooldownSeconds] = 0,
+                [ConfigKeys.MaxPendingInvoicesPerPlayer] = 1
             };
 
             Config[ConfigSections.Discord] = new Dictionary<string, object>
@@ -349,12 +556,14 @@ private class InvoiceResponse
                 [ConfigKeys.InvoiceTimeoutSeconds] = 300,
                 [ConfigKeys.LNbitsApiKey] = "your-lnbits-admin-api-key",
                 [ConfigKeys.LNbitsBaseUrl] = "https://your-lnbits-instance.com",
-                [ConfigKeys.MaxRetries] = 25
+                [ConfigKeys.MaxRetries] = 25,
+                [ConfigKeys.UseWebSockets] = true,
+                [ConfigKeys.WebSocketReconnectDelay] = 5
             };
 
             Config[ConfigSections.VIPSettings] = new Dictionary<string, object>
             {
-                [ConfigKeys.VipPermissionGroup] = "vip",
+                [ConfigKeys.VipCommand] = "oxide.usergroup add {steamid} vip",
                 [ConfigKeys.VipPrice] = 1000
             };
         }
@@ -380,20 +589,195 @@ private class InvoiceResponse
             AddCovalenceCommand(sendCurrencyCommandName, nameof(CmdSendCurrency), "orangemart.sendcurrency");
             AddCovalenceCommand(buyVipCommandName, nameof(CmdBuyVip), "orangemart.buyvip");
 
-            // Start a timer to check pending invoices periodically
-            timer.Every(checkIntervalSeconds, CheckPendingInvoices);
+            // Recover interrupted transactions
+            RecoverInterruptedTransactions();
+
+            // Start a timer to check pending invoices periodically (fallback for WebSocket failures)
+            if (!useWebSockets || checkIntervalSeconds > 0)
+            {
+                timer.Every(checkIntervalSeconds, CheckPendingInvoices);
+            }
+
+            // Cleanup old cooldown entries every 5 minutes
+            timer.Every(300f, CleanupOldCooldowns);
+
+            Puts($"Orangemart initialized. WebSockets: {(useWebSockets ? "Enabled" : "Disabled")}");
         }
 
         private void Unload()
         {
+            // Clean up all WebSocket connections
+            CleanupAllWebSockets();
+            
             pendingInvoices.Clear();
             retryCounts.Clear();
+            lastCommandTime.Clear();
+        }
+
+        // NEW: Protection Methods
+
+        // Rate limiting system
+        private bool IsOnCooldown(IPlayer player, string commandType)
+        {
+            if (commandCooldownSeconds <= 0) return false; // Cooldown disabled
+            
+            string key = $"{GetPlayerId(player)}:{commandType}";
+            
+            if (lastCommandTime.TryGetValue(key, out DateTime lastTime))
+            {
+                double secondsSince = (DateTime.UtcNow - lastTime).TotalSeconds;
+                if (secondsSince < commandCooldownSeconds)
+                {
+                    double remaining = commandCooldownSeconds - secondsSince;
+                    player.Reply(Lang("CommandOnCooldown", player.Id, commandType, Math.Ceiling(remaining)));
+                    return true;
+                }
+            }
+            
+            lastCommandTime[key] = DateTime.UtcNow;
+            return false;
+        }
+
+        // Pending invoice limit check
+        private bool HasTooManyPendingInvoices(IPlayer player)
+        {
+            // 0 = no limit
+            if (maxPendingInvoicesPerPlayer == 0) return false;
+            
+            string playerId = GetPlayerId(player);
+            int pendingCount = pendingInvoices.Count(inv => GetPlayerId(inv.Player) == playerId);
+            
+            if (pendingCount >= maxPendingInvoicesPerPlayer)
+            {
+                player.Reply(Lang("TooManyPendingInvoices", player.Id, pendingCount, maxPendingInvoicesPerPlayer));
+                return true;
+            }
+            
+            return false;
+        }
+
+        // Amount validation with overflow protection
+        private bool ValidatePurchaseAmount(IPlayer player, int amount, out int safeSats)
+        {
+            safeSats = 0;
+            
+            // Basic validation
+            if (amount <= 0)
+            {
+                player.Reply(Lang("InvalidAmount", player.Id));
+                return false;
+            }
+            
+            // Maximum amount check (0 = no limit)
+            if (maxPurchaseAmount > 0 && amount > maxPurchaseAmount)
+            {
+                player.Reply(Lang("AmountTooLarge", player.Id, amount, maxPurchaseAmount, currencyName));
+                return false;
+            }
+            
+            // Integer overflow protection
+            long amountSatsLong = (long)amount * pricePerCurrencyUnit;
+            if (amountSatsLong > int.MaxValue)
+            {
+                player.Reply(Lang("AmountCausesOverflow", player.Id));
+                return false;
+            }
+            
+            safeSats = (int)amountSatsLong;
+            return true;
+        }
+
+        // Send amount validation
+        private bool ValidateSendAmount(IPlayer player, int amount, out int safeSats)
+        {
+            safeSats = 0;
+            
+            // Basic validation
+            if (amount <= 0)
+            {
+                player.Reply(Lang("InvalidAmount", player.Id));
+                return false;
+            }
+            
+            // Maximum amount check (0 = no limit)
+            if (maxSendAmount > 0 && amount > maxSendAmount)
+            {
+                player.Reply(Lang("SendAmountTooLarge", player.Id, amount, maxSendAmount, currencyName));
+                return false;
+            }
+            
+            // Integer overflow protection
+            long amountSatsLong = (long)amount * satsPerCurrencyUnit;
+            if (amountSatsLong > int.MaxValue)
+            {
+                player.Reply(Lang("AmountCausesOverflow", player.Id));
+                return false;
+            }
+            
+            safeSats = (int)amountSatsLong;
+            return true;
+        }
+
+        // VIP price validation
+        private bool ValidateVipPrice(IPlayer player, out int safeSats)
+        {
+            safeSats = 0;
+            
+            // Check if VIP price would cause overflow
+            if (vipPrice > int.MaxValue)
+            {
+                player.Reply(Lang("VipPriceTooHigh", player.Id));
+                PrintError($"VIP price {vipPrice} exceeds int.MaxValue");
+                return false;
+            }
+            
+            safeSats = vipPrice;
+            return true;
+        }
+
+        private void CleanupOldCooldowns()
+        {
+            var expiredKeys = lastCommandTime
+                .Where(kvp => (DateTime.UtcNow - kvp.Value).TotalSeconds > commandCooldownSeconds * 2)
+                .Select(kvp => kvp.Key)
+                .ToList();
+            
+            foreach (var key in expiredKeys)
+            {
+                lastCommandTime.Remove(key);
+            }
+            
+            if (expiredKeys.Count > 0)
+            {
+                Puts($"Cleaned up {expiredKeys.Count} expired cooldown entries.");
+            }
+        }
+
+        private void CleanupAllWebSockets()
+        {
+            lock (webSocketLock)
+            {
+                foreach (var kvp in activeWebSockets)
+                {
+                    try
+                    {
+                        kvp.Value.CancellationTokenSource?.Cancel();
+                        kvp.Value.WebSocket?.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        PrintError($"Error cleaning up WebSocket for {kvp.Key}: {ex.Message}");
+                    }
+                }
+                activeWebSockets.Clear();
+            }
         }
 
         protected override void LoadDefaultMessages()
         {
             lang.RegisterMessages(new Dictionary<string, string>
             {
+                // Existing messages
                 ["UsageSendCurrency"] = "Usage: /{0} <amount> <lightning_address>",
                 ["NeedMoreCurrency"] = "You need more {0}. You currently have {1}.",
                 ["FailedToReserveCurrency"] = "Failed to reserve currency. Please try again.",
@@ -414,7 +798,18 @@ private class InvoiceResponse
                 ["BlacklistedDomain"] = "The domain '{0}' is currently blacklisted. Please use a different Lightning address.",
                 ["NotWhitelistedDomain"] = "The domain '{0}' is not whitelisted. Please use a Lightning address from the following domains: {1}.",
                 ["InvalidLightningAddress"] = "The Lightning Address provided is invalid or cannot be resolved.",
-                ["PaymentProcessing"] = "Your payment is being processed. You will receive a confirmation once it's complete."
+                ["PaymentProcessing"] = "Your payment is being processed. You will receive a confirmation once it's complete.",
+                ["TransactionInitiated"] = "Transaction initiated. Processing your payment...",
+                
+                // NEW: Protection and validation messages
+                ["InvalidAmount"] = "Invalid amount. Please enter a positive number.",
+                ["AmountTooLarge"] = "Amount {0} exceeds maximum limit of {1} {2}. Please use a smaller amount.",
+                ["SendAmountTooLarge"] = "Send amount {0} exceeds maximum limit of {1} {2}. Please use a smaller amount.",
+                ["AmountCausesOverflow"] = "Amount too large and would cause calculation errors. Please use a smaller amount.",
+                ["CommandOnCooldown"] = "Command '{0}' is on cooldown. Please wait {1} more seconds.",
+                ["TooManyPendingInvoices"] = "You have {0} pending invoices (max: {1}). Please complete or wait for them to expire.",
+                ["VipPriceTooHigh"] = "VIP price is configured too high. Please contact an administrator.",
+                ["ProtectionLimits"] = "Orangemart Limits: Purchase max {0}, Send max {1}, Cooldown {2}s"
             }, this);
         }
 
@@ -423,224 +818,433 @@ private class InvoiceResponse
             return string.Format(lang.GetMessage(key, this, userId), args);
         }
 
-        private List<Item> GetAllInventoryItems(BasePlayer player)
+        // Helper method to generate unique transaction IDs
+        private string GenerateTransactionId()
         {
-            List<Item> allItems = new List<Item>();
-
-            // Main Inventory
-            if (player.inventory.containerMain != null)
-                allItems.AddRange(player.inventory.containerMain.itemList);
-
-            // Belt (Hotbar)
-            if (player.inventory.containerBelt != null)
-                allItems.AddRange(player.inventory.containerBelt.itemList);
-
-            // Wear (Clothing)
-            if (player.inventory.containerWear != null)
-                allItems.AddRange(player.inventory.containerWear.itemList);
-
-            return allItems;
+            return $"{DateTime.UtcNow.Ticks}-{Guid.NewGuid().ToString("N").Substring(0, 8)}";
         }
 
-        private bool IsCurrencyItem(Item item)
-{
-    return item.info.itemid == currencyItemID && (currencySkinID == 0 || item.skin == currencySkinID);
-}
-
-private bool TryReserveCurrency(BasePlayer player, int amount)
-{
-    var items = GetAllInventoryItems(player).Where(IsCurrencyItem).ToList();
-    int totalCurrency = items.Sum(item => item.amount);
-
-    if (totalCurrency < amount)
-    {
-        return false;
-    }
-
-    int remaining = amount;
-
-    foreach (var item in items)
-    {
-        if (item.amount > remaining)
+        // WebSocket connection management
+        private async Task ConnectWebSocket(PendingInvoice invoice)
         {
-            item.UseItem(remaining);
-            break;
-        }
-        else
-        {
-            remaining -= item.amount;
-            item.Remove();
-        }
-
-        if (remaining <= 0)
-        {
-            break;
-        }
-    }
-
-    return true;
-}
-
-        private void CheckPendingInvoices()
-        {
-            foreach (var invoice in pendingInvoices.ToList())
+            if (!useWebSockets)
             {
-                string localPaymentHash = invoice.RHash.ToLower();
-                CheckInvoicePaid(localPaymentHash, isPaid =>
+                Puts($"WebSockets disabled, using HTTP polling for invoice {invoice.RHash}");
+                return;
+            }
+
+            var wsConnection = new WebSocketConnection
+            {
+                WebSocket = new ClientWebSocket(),
+                CancellationTokenSource = new CancellationTokenSource(),
+                InvoiceKey = invoice.RHash,
+                Invoice = invoice,
+                ConnectedAt = DateTime.UtcNow,
+                ReconnectAttempts = 0
+            };
+
+            wsConnection.WebSocket.Options.SetRequestHeader("X-Api-Key", config.ApiKey);
+
+            lock (webSocketLock)
+            {
+                if (activeWebSockets.ContainsKey(invoice.RHash))
                 {
-                    if (isPaid)
+                    var existing = activeWebSockets[invoice.RHash];
+                    existing.CancellationTokenSource?.Cancel();
+                    existing.WebSocket?.Dispose();
+                }
+                activeWebSockets[invoice.RHash] = wsConnection;
+            }
+
+            try
+            {
+                // Try the payment hash endpoint first
+                var wsUrl = $"{config.WebSocketUrl}/api/v1/ws/{invoice.RHash}";
+                Puts($"[WebSocket] Attempting to connect to: {wsUrl}");
+                
+                await wsConnection.WebSocket.ConnectAsync(new Uri(wsUrl), wsConnection.CancellationTokenSource.Token);
+                
+                Puts($"WebSocket connected for invoice {invoice.RHash}");
+                wsConnection.ListenTask = Task.Run(async () => await ListenToWebSocket(wsConnection), wsConnection.CancellationTokenSource.Token);
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Failed to connect WebSocket for invoice {invoice.RHash}: {ex.Message}");
+                
+                lock (webSocketLock)
+                {
+                    activeWebSockets.Remove(invoice.RHash);
+                }
+                
+                // Enable HTTP polling as fallback immediately
+                Puts($"[WebSocket] Falling back to HTTP polling for {invoice.RHash}");
+                
+                if (wsConnection.ReconnectAttempts < 3)
+                {
+                    timer.Once(webSocketReconnectDelay, () =>
                     {
-                        pendingInvoices.Remove(invoice);
-
-                        switch (invoice.Type)
+                        if (pendingInvoices.Contains(invoice))
                         {
-                            case PurchaseType.Currency:
-                                RewardPlayer(invoice.Player, invoice.Amount);
-                                break;
-                            case PurchaseType.Vip:
-                                GrantVip(invoice.Player);
-                                break;
-                            case PurchaseType.SendBitcoin:
-                                invoice.Player.Reply(Lang("CurrencySentSuccess", invoice.Player.Id, invoice.Amount, currencyName));
-                                break;
+                            wsConnection.ReconnectAttempts++;
+                            Task.Run(async () => await ConnectWebSocket(invoice));
                         }
-
-                        if (invoice.Type == PurchaseType.SendBitcoin)
-                        {
-                            var logEntry = new SellInvoiceLogEntry
-                            {
-                                SteamID = GetPlayerId(invoice.Player),
-                                LightningAddress = ExtractLightningAddress(invoice.Memo),
-                                Success = true,
-                                SatsAmount = invoice.Amount,
-                                PaymentHash = invoice.RHash,
-                                CurrencyReturned = false,
-                                Timestamp = DateTime.UtcNow,
-                                RetryCount = retryCounts.ContainsKey(invoice.RHash) ? retryCounts[invoice.RHash] : 0
-                            };
-                            LogSellTransaction(logEntry);
-
-                            Puts($"Invoice {invoice.RHash} marked as paid. RetryCount: {logEntry.RetryCount}");
-                        }
-                        else
-                        {
-                            var logEntry = CreateBuyInvoiceLogEntry(
-                                player: invoice.Player,
-                                invoiceID: invoice.RHash,
-                                isPaid: true,
-                                amount: invoice.Type == PurchaseType.SendBitcoin ? invoice.Amount : invoice.Amount * pricePerCurrencyUnit,
-                                type: invoice.Type,
-                                retryCount: retryCounts.ContainsKey(invoice.RHash) ? retryCounts[invoice.RHash] : 0
-                            );
-                            LogBuyInvoice(logEntry);
-                            Puts($"Invoice {invoice.RHash} marked as paid. RetryCount: {logEntry.RetryCount}");
-                        }
-
-                        retryCounts.Remove(invoice.RHash);
-                    }
-                    else
-                    {
-                        if (!retryCounts.ContainsKey(localPaymentHash))
-                        {
-                            retryCounts[localPaymentHash] = 0;
-                            Puts($"Initialized retry count for paymentHash: {localPaymentHash}");
-                        }
-
-                        retryCounts[localPaymentHash]++;
-                        Puts($"Retry count for paymentHash {localPaymentHash}: {retryCounts[localPaymentHash]} of {maxRetries}");
-
-                        if (retryCounts[localPaymentHash] >= maxRetries)
-                        {
-                            pendingInvoices.Remove(invoice);
-                            int finalRetryCount = retryCounts[localPaymentHash];
-                            retryCounts.Remove(localPaymentHash);
-                            PrintWarning($"Invoice for player {GetPlayerId(invoice.Player)} expired (amount: {invoice.Amount} sats).");
-
-                            invoice.Player.Reply(Lang("InvoiceExpired", invoice.Player.Id, invoice.Amount));
-
-                            if (invoice.Type == PurchaseType.SendBitcoin)
-                            {
-                                var basePlayer = invoice.Player.Object as BasePlayer;
-                                if (basePlayer != null)
-                                {
-                                    ReturnCurrency(basePlayer, invoice.Amount / satsPerCurrencyUnit);
-                                    Puts($"Refunded {invoice.Amount / satsPerCurrencyUnit} {currencyName} to player {basePlayer.UserIDString} due to failed payment.");
-                                }
-                                else
-                                {
-                                    PrintError($"Failed to find base player object for player {invoice.Player.Id} to refund currency.");
-                                }
-
-                                var failedLogEntry = new SellInvoiceLogEntry
-                                {
-                                    SteamID = GetPlayerId(invoice.Player),
-                                    LightningAddress = ExtractLightningAddress(invoice.Memo),
-                                    Success = false,
-                                    SatsAmount = invoice.Amount,
-                                    PaymentHash = invoice.RHash,
-                                    CurrencyReturned = true,
-                                    Timestamp = DateTime.UtcNow,
-                                    RetryCount = finalRetryCount
-                                };
-                                LogSellTransaction(failedLogEntry);
-                                Puts($"Invoice {localPaymentHash} expired after {finalRetryCount} retries.");
-                            }
-                            else
-                            {
-                                var failedLogEntry = CreateBuyInvoiceLogEntry(
-                                    player: invoice.Player,
-                                    invoiceID: localPaymentHash,
-                                    isPaid: false,
-                                    amount: invoice.Type == PurchaseType.SendBitcoin ? invoice.Amount : invoice.Amount * pricePerCurrencyUnit,
-                                    type: invoice.Type,
-                                    retryCount: finalRetryCount
-                                );
-                                LogBuyInvoice(failedLogEntry);
-                                Puts($"Invoice {localPaymentHash} expired after {finalRetryCount} retries.");
-                            }
-                        }
-                        else
-                        {
-                            PrintWarning($"Retrying invoice {localPaymentHash}. Attempt {retryCounts[localPaymentHash]} of {maxRetries}.");
-                        }
-                    }
-                });
+                    });
+                }
             }
         }
 
-        private void CheckInvoicePaid(string paymentHash, Action<bool> callback)
+        private async Task ListenToWebSocket(WebSocketConnection connection)
         {
-            string normalizedPaymentHash = paymentHash.ToLower();
-            string url = $"{config.BaseUrl}/api/v1/payments/{normalizedPaymentHash}";
+            var buffer = new ArraySegment<byte>(new byte[4096]);
+            var messageBuilder = new StringBuilder();
 
-            var headers = new Dictionary<string, string>
+            try
             {
-                { "Content-Type", "application/json" },
-                { "X-Api-Key", config.ApiKey }
-            };
+                while (connection.WebSocket.State == WebSocketState.Open && !connection.CancellationTokenSource.Token.IsCancellationRequested)
+                {
+                    WebSocketReceiveResult result;
+                    messageBuilder.Clear();
 
-            MakeWebRequest(url, null, (code, response) =>
+                    do
+                    {
+                        result = await connection.WebSocket.ReceiveAsync(buffer, connection.CancellationTokenSource.Token);
+                        
+                        if (result.MessageType == WebSocketMessageType.Text)
+                        {
+                            messageBuilder.Append(Encoding.UTF8.GetString(buffer.Array, 0, result.Count));
+                        }
+                        else if (result.MessageType == WebSocketMessageType.Close)
+                        {
+                            await connection.WebSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+                            break;
+                        }
+                    }
+                    while (!result.EndOfMessage);
+
+                    if (messageBuilder.Length > 0)
+                    {
+                        var message = messageBuilder.ToString();
+                        ProcessWebSocketMessage(connection, message);
+                    }
+                }
+            }
+            catch (WebSocketException wsEx)
             {
-                if (code != 200 || string.IsNullOrEmpty(response))
+                PrintError($"WebSocket error for invoice {connection.InvoiceKey}: {wsEx.Message}");
+            }
+            catch (TaskCanceledException)
+            {
+                // Expected when cancellation is requested
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Unexpected error in WebSocket listener for invoice {connection.InvoiceKey}: {ex.Message}");
+            }
+            finally
+            {
+                // Clean up
+                lock (webSocketLock)
                 {
-                    PrintError($"Error checking invoice status: HTTP {code}");
-                    callback(false);
-                    return;
+                    if (activeWebSockets.ContainsKey(connection.InvoiceKey))
+                    {
+                        activeWebSockets.Remove(connection.InvoiceKey);
+                    }
                 }
 
-                try
+                if (connection.WebSocket?.State == WebSocketState.Open)
                 {
-                    var paymentStatus = JsonConvert.DeserializeObject<PaymentStatusResponse>(response);
-                    callback(paymentStatus != null && paymentStatus.Paid);
+                    try
+                    {
+                        await connection.WebSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+                    }
+                    catch { }
                 }
-                catch (Exception ex)
-                {
-                    PrintError($"Failed to parse invoice status response: {ex.Message}");
-                    callback(false);
-                }
-            }, RequestMethod.GET, headers);
+
+                connection.WebSocket?.Dispose();
+            }
         }
 
+        private void ProcessWebSocketMessage(WebSocketConnection connection, string message)
+        {
+            try
+            {
+                // Log all WebSocket messages for debugging
+                Puts($"[WebSocket] Raw message for {connection.InvoiceKey}: {message}");
+                
+                // Try to parse as the simple format first: {"pending": false, "status": "success"}
+                try
+                {
+                    var simpleUpdate = JsonConvert.DeserializeObject<Dictionary<string, object>>(message);
+                    
+                    if (simpleUpdate != null && simpleUpdate.ContainsKey("pending") && simpleUpdate.ContainsKey("status"))
+                    {
+                        bool isPending = Convert.ToBoolean(simpleUpdate["pending"]);
+                        string status = simpleUpdate["status"]?.ToString();
+                        
+                        Puts($"[WebSocket] Simple format - Pending: {isPending}, Status: {status}");
+                        
+                        if (!isPending && status == "success")
+                        {
+                            Puts($"[WebSocket] Payment confirmed via simple format for {connection.InvoiceKey}");
+                            ProcessPaymentConfirmation(connection.Invoice);
+                            connection.CancellationTokenSource?.Cancel();
+                            return;
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    // Fall through to try the complex format
+                }
+                
+                // Try to parse as the complex format: {"payment": {...}}
+                try
+                {
+                    var update = JsonConvert.DeserializeObject<WebSocketPaymentUpdate>(message);
+                    
+                    if (update?.Payment != null)
+                    {
+                        Puts($"[WebSocket] Complex format - Hash: {update.Payment.PaymentHash}, Pending: {update.Payment.Pending}, Preimage: {update.Payment.Preimage}");
+                        
+                        // Check if payment is confirmed (not pending)
+                        if (!update.Payment.Pending && !string.IsNullOrEmpty(update.Payment.Preimage))
+                        {
+                            Puts($"[WebSocket] Payment confirmed via complex format (preimage) for {connection.InvoiceKey}");
+                            ProcessPaymentConfirmation(connection.Invoice);
+                            connection.CancellationTokenSource?.Cancel();
+                            return;
+                        }
+                        // Alternative check: if payment hash matches and not pending
+                        else if (!update.Payment.Pending && update.Payment.PaymentHash?.ToLower() == connection.InvoiceKey.ToLower())
+                        {
+                            Puts($"[WebSocket] Payment confirmed via complex format (hash match) for {connection.InvoiceKey}");
+                            ProcessPaymentConfirmation(connection.Invoice);
+                            connection.CancellationTokenSource?.Cancel();
+                            return;
+                        }
+                    }
+                }
+                catch (Exception)
+                {
+                    // Neither format worked
+                }
+                
+                Puts($"[WebSocket] Message did not indicate payment completion for {connection.InvoiceKey}");
+            }
+            catch (Exception ex)
+            {
+                PrintError($"Error processing WebSocket message for invoice {connection.InvoiceKey}: {ex.Message}");
+                Puts($"[WebSocket] Problematic message: {message}");
+            }
+        }
+
+        private void ProcessPaymentConfirmation(PendingInvoice invoice)
+        {
+            // Check if this invoice was already processed to prevent duplicates
+            if (!pendingInvoices.Contains(invoice))
+            {
+                Puts($"[ProcessPayment] Invoice {invoice.RHash} already processed, skipping");
+                return;
+            }
+
+            // Remove from pending list immediately to prevent duplicate processing
+            pendingInvoices.Remove(invoice);
+            
+            Puts($"[ProcessPayment] Processing payment confirmation for {invoice.RHash}, Type: {invoice.Type}");
+
+            // Process based on type
+            switch (invoice.Type)
+            {
+                case PurchaseType.Currency:
+                    RewardPlayer(invoice.Player, invoice.Amount);
+                    UpdateBuyTransactionStatus(invoice.TransactionId, TransactionStatus.COMPLETED, true);
+                    break;
+                case PurchaseType.Vip:
+                    GrantVip(invoice.Player);
+                    UpdateBuyTransactionStatus(invoice.TransactionId, TransactionStatus.COMPLETED, true);
+                    break;
+                case PurchaseType.SendBitcoin:
+                    invoice.Player.Reply(Lang("CurrencySentSuccess", invoice.Player.Id, invoice.Amount / satsPerCurrencyUnit, currencyName));
+                    UpdateSellTransactionStatus(invoice.TransactionId, TransactionStatus.COMPLETED, true);
+                    break;
+            }
+
+            // Clean up
+            retryCounts.Remove(invoice.RHash);
+            
+            // Close WebSocket
+            lock (webSocketLock)
+            {
+                if (activeWebSockets.ContainsKey(invoice.RHash))
+                {
+                    var ws = activeWebSockets[invoice.RHash];
+                    ws.CancellationTokenSource?.Cancel();
+                    activeWebSockets.Remove(invoice.RHash);
+                }
+            }
+
+            Puts($"Payment confirmed for invoice {invoice.RHash}, TransactionId: {invoice.TransactionId}");
+        }
+
+        // Recovery logic for interrupted transactions
+        private void RecoverInterruptedTransactions()
+        {
+            Puts("Checking for interrupted transactions...");
+
+            // Recover sell transactions
+            var sellLogs = LoadSellLogData();
+            var interruptedSells = sellLogs.Where(l => 
+                l.Status == TransactionStatus.INITIATED || 
+                l.Status == TransactionStatus.PROCESSING).ToList();
+
+            foreach (var log in interruptedSells)
+            {
+                Puts($"Found interrupted sell transaction: {log.TransactionId} for player {log.SteamID}");
+                
+                // Mark as failed and refund if payment hash exists
+                if (!string.IsNullOrEmpty(log.PaymentHash))
+                {
+                    // Check if payment was actually completed
+                    CheckInvoicePaid(log.PaymentHash, isPaid =>
+                    {
+                        if (isPaid)
+                        {
+                            // Payment was completed, update status
+                            UpdateSellTransactionStatus(log.TransactionId, TransactionStatus.COMPLETED, true);
+                            Puts($"Recovered completed sell transaction: {log.TransactionId}");
+                        }
+                        else
+                        {
+                            // Payment failed, mark as failed
+                            UpdateSellTransactionStatus(log.TransactionId, TransactionStatus.FAILED, false, "Server interrupted");
+                            Puts($"Marked interrupted sell transaction as failed: {log.TransactionId}");
+                        }
+                    });
+                }
+                else
+                {
+                    // No payment hash, mark as failed
+                    UpdateSellTransactionStatus(log.TransactionId, TransactionStatus.FAILED, false, "Server interrupted before payment initiation");
+                }
+            }
+
+            // Recover buy transactions
+            var buyLogs = LoadBuyLogData();
+            var interruptedBuys = buyLogs.Where(l => 
+                l.Status == TransactionStatus.INITIATED || 
+                l.Status == TransactionStatus.PROCESSING).ToList();
+
+            foreach (var log in interruptedBuys)
+            {
+                Puts($"Found interrupted buy transaction: {log.TransactionId} for player {log.SteamID}");
+                
+                // Check if invoice was paid
+                if (!string.IsNullOrEmpty(log.InvoiceID))
+                {
+                    CheckInvoicePaid(log.InvoiceID, isPaid =>
+                    {
+                        if (isPaid)
+                        {
+                            // Payment was completed, update status
+                            UpdateBuyTransactionStatus(log.TransactionId, TransactionStatus.COMPLETED, true);
+                            Puts($"Recovered completed buy transaction: {log.TransactionId}");
+                        }
+                        else
+                        {
+                            // Payment failed, mark as expired
+                            UpdateBuyTransactionStatus(log.TransactionId, TransactionStatus.EXPIRED, false);
+                            Puts($"Marked interrupted buy transaction as expired: {log.TransactionId}");
+                        }
+                    });
+                }
+            }
+        }
+
+        // PROTECTED COMMAND METHODS
+
+        // Protected CmdBuyCurrency method
+        private void CmdBuyCurrency(IPlayer player, string command, string[] args)
+        {
+            if (!player.HasPermission("orangemart.buycurrency"))
+            {
+                player.Reply(Lang("NoPermission", player.Id));
+                return;
+            }
+
+            // Rate limiting check
+            if (IsOnCooldown(player, "buy")) return;
+
+            // Pending invoice limit check
+            if (HasTooManyPendingInvoices(player)) return;
+
+            if (args.Length != 1 || !int.TryParse(args[0], out int amount))
+            {
+                player.Reply(Lang("InvalidCommandUsage", player.Id, buyCurrencyCommandName));
+                return;
+            }
+
+            // Amount validation with overflow protection
+            if (!ValidatePurchaseAmount(player, amount, out int amountSats)) return;
+
+            string transactionId = GenerateTransactionId();
+
+            // Log transaction initiation
+            var initialLogEntry = new BuyInvoiceLogEntry
+            {
+                TransactionId = transactionId,
+                SteamID = GetPlayerId(player),
+                InvoiceID = null,
+                Status = TransactionStatus.INITIATED,
+                IsPaid = false,
+                Timestamp = DateTime.UtcNow,
+                CompletedTimestamp = null,
+                Amount = amountSats,
+                CurrencyGiven = false,
+                VipGranted = false,
+                RetryCount = 0,
+                PurchaseType = "Currency"
+            };
+            LogBuyInvoice(initialLogEntry);
+
+            CreateInvoice(amountSats, $"Buying {amount} {currencyName}", invoiceResponse =>
+            {
+                if (invoiceResponse != null)
+                {
+                    // Update log entry with invoice ID
+                    UpdateBuyTransactionInvoiceId(transactionId, invoiceResponse.PaymentHash);
+
+                    SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, $"Buying {amount} {currencyName}");
+
+                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, discordChannelName));
+
+                    var pendingInvoice = new PendingInvoice
+                    {
+                        TransactionId = transactionId,
+                        RHash = invoiceResponse.PaymentHash.ToLower(),
+                        Player = player,
+                        Amount = amount,
+                        Memo = $"Buying {amount} {currencyName}",
+                        CreatedAt = DateTime.UtcNow,
+                        Type = PurchaseType.Currency
+                    };
+                    pendingInvoices.Add(pendingInvoice);
+
+                    // Connect WebSocket for monitoring
+                    Task.Run(async () => await ConnectWebSocket(pendingInvoice));
+
+                    ScheduleInvoiceExpiry(pendingInvoice);
+                }
+                else
+                {
+                    player.Reply(Lang("FailedToCreateInvoice", player.Id));
+                    
+                    // Update transaction as failed
+                    UpdateBuyTransactionStatus(transactionId, TransactionStatus.FAILED, false);
+                }
+            });
+        }
+
+        // Protected CmdSendCurrency method
         private void CmdSendCurrency(IPlayer player, string command, string[] args)
         {
             if (!player.HasPermission("orangemart.sendcurrency"))
@@ -649,11 +1253,20 @@ private bool TryReserveCurrency(BasePlayer player, int amount)
                 return;
             }
 
-            if (args.Length != 2 || !int.TryParse(args[0], out int amount) || amount <= 0)
+            // Rate limiting check
+            if (IsOnCooldown(player, "send")) return;
+
+            // Pending invoice limit check
+            if (HasTooManyPendingInvoices(player)) return;
+
+            if (args.Length != 2 || !int.TryParse(args[0], out int amount))
             {
                 player.Reply(Lang("UsageSendCurrency", player.Id, sendCurrencyCommandName));
                 return;
             }
+
+            // Amount validation with overflow protection
+            if (!ValidateSendAmount(player, amount, out int satsAmount)) return;
 
             string lightningAddress = args[1];
 
@@ -693,63 +1306,451 @@ private bool TryReserveCurrency(BasePlayer player, int amount)
                 return;
             }
 
-            player.Reply(Lang("PaymentProcessing", player.Id));
+            // Generate transaction ID and log initiation immediately
+            string transactionId = GenerateTransactionId();
 
-            SendBitcoin(lightningAddress, amount * satsPerCurrencyUnit, (success, paymentHash) =>
+            // Log transaction initiation
+            var initialLogEntry = new SellInvoiceLogEntry
+            {
+                TransactionId = transactionId,
+                SteamID = GetPlayerId(player),
+                LightningAddress = lightningAddress,
+                Status = TransactionStatus.INITIATED,
+                Success = false,
+                SatsAmount = satsAmount,
+                PaymentHash = null,
+                CurrencyReturned = false,
+                Timestamp = DateTime.UtcNow,
+                CompletedTimestamp = null,
+                RetryCount = 0,
+                FailureReason = null
+            };
+            LogSellTransaction(initialLogEntry);
+
+            player.Reply(Lang("TransactionInitiated", player.Id));
+
+            SendBitcoin(lightningAddress, satsAmount, (success, paymentHash) =>
             {
                 if (success && !string.IsNullOrEmpty(paymentHash))
                 {
-                    LogSellTransaction(
-                        new SellInvoiceLogEntry
-                        {
-                            SteamID = GetPlayerId(player),
-                            LightningAddress = lightningAddress,
-                            Success = true,
-                            SatsAmount = amount * satsPerCurrencyUnit,
-                            PaymentHash = paymentHash,
-                            CurrencyReturned = false,
-                            Timestamp = DateTime.UtcNow,
-                            RetryCount = 0
-                        }
-                    );
+                    // Update log entry with payment hash
+                    UpdateSellTransactionPaymentHash(transactionId, paymentHash);
 
                     var pendingInvoice = new PendingInvoice
                     {
+                        TransactionId = transactionId,
                         RHash = paymentHash.ToLower(),
                         Player = player,
-                        Amount = amount * satsPerCurrencyUnit,
+                        Amount = satsAmount,
                         Memo = $"Sending {amount} {currencyName} to {lightningAddress}",
                         CreatedAt = DateTime.UtcNow,
                         Type = PurchaseType.SendBitcoin
                     };
                     pendingInvoices.Add(pendingInvoice);
 
-                    Puts($"Outbound payment to {lightningAddress} initiated. PaymentHash: {paymentHash}");
+                    // Connect WebSocket for monitoring
+                    Task.Run(async () => await ConnectWebSocket(pendingInvoice));
+
+                    Puts($"Outbound payment to {lightningAddress} initiated. PaymentHash: {paymentHash}, TransactionId: {transactionId}");
                 }
                 else
                 {
                     player.Reply(Lang("FailedToProcessPayment", player.Id));
 
-                    LogSellTransaction(
-                        new SellInvoiceLogEntry
-                        {
-                            SteamID = GetPlayerId(player),
-                            LightningAddress = lightningAddress,
-                            Success = false,
-                            SatsAmount = amount * satsPerCurrencyUnit,
-                            PaymentHash = null,
-                            CurrencyReturned = true,
-                            Timestamp = DateTime.UtcNow,
-                            RetryCount = 0
-                        }
-                    );
+                    // Update transaction as failed
+                    UpdateSellTransactionStatus(transactionId, TransactionStatus.FAILED, false, "Failed to initiate payment", true);
 
-                    Puts($"Outbound payment to {lightningAddress} failed to initiate.");
+                    Puts($"Outbound payment to {lightningAddress} failed to initiate. TransactionId: {transactionId}");
 
                     ReturnCurrency(basePlayer, amount);
                     Puts($"Returned {amount} {currencyName} to player {basePlayer.UserIDString} due to failed payment.");
                 }
             });
+        }
+
+        // Protected CmdBuyVip method
+        private void CmdBuyVip(IPlayer player, string command, string[] args)
+        {
+            if (!player.HasPermission("orangemart.buyvip"))
+            {
+                player.Reply(Lang("NoPermission", player.Id));
+                return;
+            }
+
+            // Rate limiting check
+            if (IsOnCooldown(player, "vip")) return;
+
+            // Pending invoice limit check
+            if (HasTooManyPendingInvoices(player)) return;
+
+            // VIP price validation
+            if (!ValidateVipPrice(player, out int amountSats)) return;
+
+            string transactionId = GenerateTransactionId();
+
+            // Log transaction initiation
+            var initialLogEntry = new BuyInvoiceLogEntry
+            {
+                TransactionId = transactionId,
+                SteamID = GetPlayerId(player),
+                InvoiceID = null,
+                Status = TransactionStatus.INITIATED,
+                IsPaid = false,
+                Timestamp = DateTime.UtcNow,
+                CompletedTimestamp = null,
+                Amount = amountSats,
+                CurrencyGiven = false,
+                VipGranted = false,
+                RetryCount = 0,
+                PurchaseType = "VIP"
+            };
+            LogBuyInvoice(initialLogEntry);
+
+            CreateInvoice(amountSats, "Buying VIP Status", invoiceResponse =>
+            {
+                if (invoiceResponse != null)
+                {
+                    // Update log entry with invoice ID
+                    UpdateBuyTransactionInvoiceId(transactionId, invoiceResponse.PaymentHash);
+
+                    SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, "Buying VIP Status");
+
+                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, discordChannelName));
+
+                    var pendingInvoice = new PendingInvoice
+                    {
+                        TransactionId = transactionId,
+                        RHash = invoiceResponse.PaymentHash.ToLower(),
+                        Player = player,
+                        Amount = amountSats,
+                        Memo = "Buying VIP Status",
+                        CreatedAt = DateTime.UtcNow,
+                        Type = PurchaseType.Vip
+                    };
+                    pendingInvoices.Add(pendingInvoice);
+
+                    // Connect WebSocket for monitoring
+                    Task.Run(async () => await ConnectWebSocket(pendingInvoice));
+
+                    ScheduleInvoiceExpiry(pendingInvoice);
+                }
+                else
+                {
+                    player.Reply(Lang("FailedToCreateInvoice", player.Id));
+                    
+                    // Update transaction as failed
+                    UpdateBuyTransactionStatus(transactionId, TransactionStatus.FAILED, false);
+                }
+            });
+        }
+
+        // TEMPORARILY COMMENTED OUT - ADMIN COMMANDS
+        // Uncomment these once the core plugin is working
+        /*
+        [ConsoleCommand("orangemart.limits")]
+        private void CmdShowLimits(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.connection?.player as BasePlayer;
+            if (player != null && !player.IsAdmin) return;
+                
+            arg.ReplyWith("=== Orangemart Protection Limits ===");
+            arg.ReplyWith($"Max Purchase Amount: {maxPurchaseAmount} {currencyName}");
+            arg.ReplyWith($"Max Send Amount: {maxSendAmount} {currencyName}");
+            arg.ReplyWith($"Command Cooldown: {commandCooldownSeconds} seconds");
+            arg.ReplyWith($"Max Pending Invoices: {maxPendingInvoicesPerPlayer} per player");
+            arg.ReplyWith($"Active Pending Invoices: {pendingInvoices.Count}");
+            arg.ReplyWith($"Players on Cooldown: {lastCommandTime.Count(kvp => (DateTime.UtcNow - kvp.Value).TotalSeconds < commandCooldownSeconds)}");
+        }
+
+        [ConsoleCommand("orangemart.clearcooldowns")]
+        private void CmdClearCooldowns(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.connection?.player as BasePlayer;
+            if (player != null && !player.IsAdmin) return;
+                
+            int cleared = lastCommandTime.Count;
+            lastCommandTime.Clear();
+            arg.ReplyWith($"Cleared {cleared} command cooldowns.");
+            Puts($"Admin {player?.displayName ?? "Console"} cleared all command cooldowns.");
+        }
+
+        [ConsoleCommand("orangemart.clearcooldown")]
+        private void CmdClearPlayerCooldown(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.connection?.player as BasePlayer;
+            if (player != null && !player.IsAdmin) return;
+                
+            if (arg.Args == null || arg.Args.Length == 0)
+            {
+                arg.ReplyWith("Usage: orangemart.clearcooldown <steamid>");
+                return;
+            }
+            
+            string steamId = arg.Args[0];
+            int cleared = 0;
+            
+            var keysToRemove = lastCommandTime.Keys.Where(k => k.StartsWith(steamId + ":")).ToList();
+            foreach (var key in keysToRemove)
+            {
+                lastCommandTime.Remove(key);
+                cleared++;
+            }
+            
+            arg.ReplyWith($"Cleared {cleared} cooldowns for player {steamId}.");
+            Puts($"Admin {player?.displayName ?? "Console"} cleared cooldowns for player {steamId}.");
+        }
+
+        [ConsoleCommand("orangemart.playerstats")]
+        private void CmdPlayerStats(ConsoleSystem.Arg arg)
+        {
+            BasePlayer player = arg.connection?.player as BasePlayer;
+            if (player != null && !player.IsAdmin) return;
+                
+            if (arg.Args == null || arg.Args.Length == 0)
+            {
+                arg.ReplyWith("Usage: orangemart.playerstats <steamid>");
+                return;
+            }
+            
+            string steamId = arg.Args[0];
+            int pendingCount = pendingInvoices.Count(inv => GetPlayerId(inv.Player) == steamId);
+            
+            bool onCooldown = false;
+            DateTime lastTime = DateTime.MinValue;
+            foreach (var kvp in lastCommandTime)
+            {
+                if (kvp.Key.StartsWith(steamId + ":"))
+                {
+                    if (kvp.Value > lastTime)
+                    {
+                        lastTime = kvp.Value;
+                        onCooldown = (DateTime.UtcNow - kvp.Value).TotalSeconds < commandCooldownSeconds;
+                    }
+                }
+            }
+            
+            arg.ReplyWith($"Player {steamId} stats:");
+            arg.ReplyWith($"- Pending invoices: {pendingCount}/{maxPendingInvoicesPerPlayer}");
+            arg.ReplyWith($"- On cooldown: {onCooldown}");
+            arg.ReplyWith($"- Last command: {(lastTime == DateTime.MinValue ? "Never" : lastTime.ToString())}");
+        }
+        */
+
+        [ChatCommand("orangelimits")]
+        private void CmdPlayerLimits(BasePlayer player, string command, string[] args)
+        {
+            var covalencePlayer = players.FindPlayerById(player.UserIDString);
+            if (covalencePlayer == null ||
+                (!covalencePlayer.HasPermission("orangemart.buycurrency") && 
+                !covalencePlayer.HasPermission("orangemart.sendcurrency") && 
+                !covalencePlayer.HasPermission("orangemart.buyvip")))
+            {
+                player.ChatMessage("You do not have permission to use Orangemart commands.");
+                return;
+            }
+            
+            player.ChatMessage(Lang("ProtectionLimits", player.UserIDString, maxPurchaseAmount, maxSendAmount, commandCooldownSeconds));
+            
+            // Show player's current status
+            string playerId = player.UserIDString;
+            int pendingCount = pendingInvoices.Count(inv => GetPlayerId(inv.Player) == playerId);
+            
+            bool onCooldown = false;
+            string cooldownCommands = "";
+            foreach (var kvp in lastCommandTime)
+            {
+                if (kvp.Key.StartsWith(playerId + ":"))
+                {
+                    double remaining = commandCooldownSeconds - (DateTime.UtcNow - kvp.Value).TotalSeconds;
+                    if (remaining > 0)
+                    {
+                        onCooldown = true;
+                        string cmd = kvp.Key.Split(':')[1];
+                        cooldownCommands += $"{cmd}({Math.Ceiling(remaining)}s) ";
+                    }
+                }
+            }
+            
+            player.ChatMessage($"Your status: {pendingCount}/{maxPendingInvoicesPerPlayer} pending invoices");
+            if (onCooldown)
+            {
+                player.ChatMessage($"Cooldowns: {cooldownCommands.Trim()}");
+            }
+        }
+
+        // HELPER METHODS
+
+        private List<Item> GetAllInventoryItems(BasePlayer player)
+        {
+            List<Item> allItems = new List<Item>();
+
+            // Main Inventory
+            if (player.inventory.containerMain != null)
+                allItems.AddRange(player.inventory.containerMain.itemList);
+
+            // Belt (Hotbar)
+            if (player.inventory.containerBelt != null)
+                allItems.AddRange(player.inventory.containerBelt.itemList);
+
+            // Wear (Clothing)
+            if (player.inventory.containerWear != null)
+                allItems.AddRange(player.inventory.containerWear.itemList);
+
+            return allItems;
+        }
+
+        private bool IsCurrencyItem(Item item)
+        {
+            return item.info.itemid == currencyItemID && (currencySkinID == 0 || item.skin == currencySkinID);
+        }
+
+        private bool TryReserveCurrency(BasePlayer player, int amount)
+        {
+            var items = GetAllInventoryItems(player).Where(IsCurrencyItem).ToList();
+            int totalCurrency = items.Sum(item => item.amount);
+
+            if (totalCurrency < amount)
+            {
+                return false;
+            }
+
+            int remaining = amount;
+
+            foreach (var item in items)
+            {
+                if (item.amount > remaining)
+                {
+                    item.UseItem(remaining);
+                    break;
+                }
+                else
+                {
+                    remaining -= item.amount;
+                    item.Remove();
+                }
+
+                if (remaining <= 0)
+                {
+                    break;
+                }
+            }
+
+            return true;
+        }
+
+        // Fallback HTTP polling for when WebSockets are disabled or fail
+        private void CheckPendingInvoices()
+        {
+            foreach (var invoice in pendingInvoices.ToList())
+            {
+                string localPaymentHash = invoice.RHash;
+                
+                // Always check via HTTP as a fallback, but log differently for WebSocket vs HTTP-only
+                bool hasActiveWebSocket = false;
+                lock (webSocketLock)
+                {
+                    hasActiveWebSocket = useWebSockets && activeWebSockets.ContainsKey(invoice.RHash);
+                }
+                
+                string checkType = hasActiveWebSocket ? "HTTP Fallback" : "HTTP Polling";
+                Puts($"[{checkType}] Checking payment status for {localPaymentHash}");
+                
+                CheckInvoicePaid(localPaymentHash, isPaid =>
+                {
+                    if (isPaid)
+                    {
+                        Puts($"[{checkType}] Payment confirmed for {localPaymentHash}");
+                        ProcessPaymentConfirmation(invoice);
+                    }
+                    else
+                    {
+                        if (!retryCounts.ContainsKey(localPaymentHash))
+                        {
+                            retryCounts[localPaymentHash] = 0;
+                            Puts($"Initialized retry count for paymentHash: {localPaymentHash}");
+                        }
+
+                        retryCounts[localPaymentHash]++;
+                        
+                        if (retryCounts[localPaymentHash] == 1)
+                        {
+                            if (invoice.Type == PurchaseType.SendBitcoin)
+                            {
+                                UpdateSellTransactionStatus(invoice.TransactionId, TransactionStatus.PROCESSING, false);
+                            }
+                            else
+                            {
+                                UpdateBuyTransactionStatus(invoice.TransactionId, TransactionStatus.PROCESSING, false);
+                            }
+                        }
+
+                        Puts($"[{checkType}] retry count for paymentHash {localPaymentHash}: {retryCounts[localPaymentHash]} of {maxRetries}");
+
+                        if (retryCounts[localPaymentHash] >= maxRetries)
+                        {
+                            pendingInvoices.Remove(invoice);
+                            int finalRetryCount = retryCounts[localPaymentHash];
+                            retryCounts.Remove(localPaymentHash);
+                            PrintWarning($"Invoice for player {GetPlayerId(invoice.Player)} expired (amount: {invoice.Amount} sats).");
+
+                            invoice.Player.Reply(Lang("InvoiceExpired", invoice.Player.Id, invoice.Amount));
+
+                            if (invoice.Type == PurchaseType.SendBitcoin)
+                            {
+                                var basePlayer = invoice.Player.Object as BasePlayer;
+                                if (basePlayer != null)
+                                {
+                                    ReturnCurrency(basePlayer, invoice.Amount / satsPerCurrencyUnit);
+                                    Puts($"Refunded {invoice.Amount / satsPerCurrencyUnit} {currencyName} to player {basePlayer.UserIDString} due to failed payment.");
+                                }
+                                else
+                                {
+                                    PrintError($"Failed to find base player object for player {invoice.Player.Id} to refund currency.");
+                                }
+
+                                UpdateSellTransactionStatus(invoice.TransactionId, TransactionStatus.EXPIRED, false, "Payment timeout", true);
+                            }
+                            else
+                            {
+                                UpdateBuyTransactionStatus(invoice.TransactionId, TransactionStatus.EXPIRED, false);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        private void CheckInvoicePaid(string paymentHash, Action<bool> callback)
+        {
+            string normalizedPaymentHash = paymentHash.ToLower();
+            string url = $"{config.BaseUrl}/api/v1/payments/{normalizedPaymentHash}";
+
+            var headers = new Dictionary<string, string>
+            {
+                { "Content-Type", "application/json" },
+                { "X-Api-Key", config.ApiKey }
+            };
+
+            MakeWebRequest(url, null, (code, response) =>
+            {
+                if (code != 200 || string.IsNullOrEmpty(response))
+                {
+                    PrintError($"Error checking invoice status: HTTP {code}");
+                    callback(false);
+                    return;
+                }
+
+                try
+                {
+                    var paymentStatus = JsonConvert.DeserializeObject<PaymentStatusResponse>(response);
+                    callback(paymentStatus != null && paymentStatus.Paid);
+                }
+                catch (Exception ex)
+                {
+                    PrintError($"Failed to parse invoice status response: {ex.Message}");
+                    callback(false);
+                }
+            }, RequestMethod.GET, headers);
         }
 
         private bool IsLightningAddressAllowed(string lightningAddress)
@@ -792,130 +1793,14 @@ private bool TryReserveCurrency(BasePlayer player, int amount)
                 {
                     if (success && !string.IsNullOrEmpty(paymentHash))
                     {
-                        StartPaymentStatusCheck(paymentHash, isPaid =>
-                        {
-                            callback(isPaid, isPaid ? paymentHash : null);
-                        });
+                        // Return success immediately - payment status will be tracked by WebSocket/polling
+                        callback(true, paymentHash);
                     }
                     else
                     {
                         callback(false, null);
                     }
                 });
-            });
-        }
-
-        private void StartPaymentStatusCheck(string paymentHash, Action<bool> callback)
-        {
-            if (!retryCounts.ContainsKey(paymentHash))
-            {
-                retryCounts[paymentHash] = 0;
-            }
-
-            Timer timerInstance = null;
-            timerInstance = timer.Repeat(checkIntervalSeconds, maxRetries, () =>
-            {
-                CheckInvoicePaid(paymentHash, isPaid =>
-                {
-                    if (isPaid)
-                    {
-                        callback(true);
-                        timerInstance.Destroy();
-                    }
-                    else
-                    {
-                        retryCounts[paymentHash]++;
-                        Puts($"PaymentHash {paymentHash} not yet paid. Retry {retryCounts[paymentHash]} of {maxRetries}.");
-
-                        if (retryCounts[paymentHash] >= maxRetries)
-                        {
-                            callback(false);
-                            timerInstance.Destroy();
-                        }
-                    }
-                });
-            });
-        }
-
-        private void CmdBuyCurrency(IPlayer player, string command, string[] args)
-        {
-            if (!player.HasPermission("orangemart.buycurrency"))
-            {
-                player.Reply(Lang("NoPermission", player.Id));
-                return;
-            }
-
-            if (args.Length != 1 || !int.TryParse(args[0], out int amount) || amount <= 0)
-            {
-                player.Reply(Lang("InvalidCommandUsage", player.Id, buyCurrencyCommandName));
-                return;
-            }
-
-            int amountSats = amount * pricePerCurrencyUnit;
-
-            CreateInvoice(amountSats, $"Buying {amount} {currencyName}", invoiceResponse =>
-            {
-                if (invoiceResponse != null)
-                {
-                    SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, $"Buying {amount} {currencyName}");
-
-                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, discordChannelName));
-
-                    var pendingInvoice = new PendingInvoice
-                    {
-                        RHash = invoiceResponse.PaymentHash.ToLower(),
-                        Player = player,
-                        Amount = amount,
-                        Memo = $"Buying {amount} {currencyName}",
-                        CreatedAt = DateTime.UtcNow,
-                        Type = PurchaseType.Currency
-                    };
-                    pendingInvoices.Add(pendingInvoice);
-
-                    ScheduleInvoiceExpiry(pendingInvoice);
-                }
-                else
-                {
-                    player.Reply(Lang("FailedToCreateInvoice", player.Id));
-                }
-            });
-        }
-
-        private void CmdBuyVip(IPlayer player, string command, string[] args)
-        {
-            if (!player.HasPermission("orangemart.buyvip"))
-            {
-                player.Reply(Lang("NoPermission", player.Id));
-                return;
-            }
-
-            int amountSats = vipPrice;
-
-            CreateInvoice(amountSats, "Buying VIP Status", invoiceResponse =>
-            {
-                if (invoiceResponse != null)
-                {
-                    SendInvoiceToDiscord(player, invoiceResponse.PaymentRequest, amountSats, "Buying VIP Status");
-
-                    player.Reply(Lang("InvoiceCreatedCheckDiscord", player.Id, discordChannelName));
-
-                    var pendingInvoice = new PendingInvoice
-                    {
-                        RHash = invoiceResponse.PaymentHash.ToLower(),
-                        Player = player,
-                        Amount = amountSats,
-                        Memo = "Buying VIP Status",
-                        CreatedAt = DateTime.UtcNow,
-                        Type = PurchaseType.Vip
-                    };
-                    pendingInvoices.Add(pendingInvoice);
-
-                    ScheduleInvoiceExpiry(pendingInvoice);
-                }
-                else
-                {
-                    player.Reply(Lang("FailedToCreateInvoice", player.Id));
-                }
             });
         }
 
@@ -927,6 +1812,17 @@ private bool TryReserveCurrency(BasePlayer player, int amount)
                 {
                     pendingInvoices.Remove(pendingInvoice);
                     PrintWarning($"Invoice for player {GetPlayerId(pendingInvoice.Player)} expired (amount: {pendingInvoice.Amount} sats).");
+
+                    // Clean up WebSocket if exists
+                    lock (webSocketLock)
+                    {
+                        if (activeWebSockets.ContainsKey(pendingInvoice.RHash))
+                        {
+                            var ws = activeWebSockets[pendingInvoice.RHash];
+                            ws.CancellationTokenSource?.Cancel();
+                            activeWebSockets.Remove(pendingInvoice.RHash);
+                        }
+                    }
 
                     int finalRetryCount = retryCounts.ContainsKey(pendingInvoice.RHash) ? retryCounts[pendingInvoice.RHash] : 0;
 
@@ -943,153 +1839,131 @@ private bool TryReserveCurrency(BasePlayer player, int amount)
                             PrintError($"Failed to find base player object for player {pendingInvoice.Player.Id} to refund currency.");
                         }
 
-                        var logEntry = new SellInvoiceLogEntry
-                        {
-                            SteamID = GetPlayerId(pendingInvoice.Player),
-                            LightningAddress = ExtractLightningAddress(pendingInvoice.Memo),
-                            Success = false,
-                            SatsAmount = pendingInvoice.Amount,
-                            PaymentHash = pendingInvoice.RHash,
-                            CurrencyReturned = true,
-                            Timestamp = DateTime.UtcNow,
-                            RetryCount = finalRetryCount
-                        };
-                        LogSellTransaction(logEntry);
-                        Puts($"Invoice {pendingInvoice.RHash} for player {GetPlayerId(pendingInvoice.Player)} expired and logged.");
+                        UpdateSellTransactionStatus(pendingInvoice.TransactionId, TransactionStatus.EXPIRED, false, "Invoice timeout", true);
                     }
                     else
                     {
-                        var logEntry = CreateBuyInvoiceLogEntry(
-                            player: pendingInvoice.Player,
-                            invoiceID: pendingInvoice.RHash,
-                            isPaid: false,
-                            amount: pendingInvoice.Type == PurchaseType.SendBitcoin ? pendingInvoice.Amount : pendingInvoice.Amount * pricePerCurrencyUnit,
-                            type: pendingInvoice.Type,
-                            retryCount: finalRetryCount
-                        );
-                        LogBuyInvoice(logEntry);
-                        Puts($"Invoice {pendingInvoice.RHash} for player {GetPlayerId(pendingInvoice.Player)} expired and logged.");
+                        UpdateBuyTransactionStatus(pendingInvoice.TransactionId, TransactionStatus.EXPIRED, false);
                     }
                 }
             });
         }
 
-        // UPDATED: SendPayment now deserializes using the wrapper class
-private void SendPayment(string bolt11, int satsAmount, Action<bool, string> callback)
-{
-    // For outbound payments, LNbits expects only "out" and "bolt11"
-    string url = $"{config.BaseUrl}/api/v1/payments";
-    var requestBody = new
-    {
-        @out = true,
-        bolt11 = bolt11
-    };
-    string jsonBody = JsonConvert.SerializeObject(requestBody);
-
-    var headers = new Dictionary<string, string>
-    {
-        { "X-Api-Key", config.ApiKey },
-        { "Content-Type", "application/json" }
-    };
-
-    MakeWebRequest(url, jsonBody, (code, response) =>
-    {
-        if (code != 200 && code != 201)
+        // SendPayment now properly handles the wrapper class
+        private void SendPayment(string bolt11, int satsAmount, Action<bool, string> callback)
         {
-            PrintError($"Error processing payment: HTTP {code}");
-            callback(false, null);
-            return;
-        }
-
-        try
-        {
-            InvoiceResponse invoiceResponse = null;
-            // First, attempt to deserialize using the wrapper (if present)
-            try
+            // For outbound payments, LNbits expects only "out" and "bolt11"
+            string url = $"{config.BaseUrl}/api/v1/payments";
+            var requestBody = new
             {
-                var wrapper = JsonConvert.DeserializeObject<InvoiceResponseWrapper>(response);
-                invoiceResponse = wrapper?.Data;
-            }
-            catch { }
+                @out = true,
+                bolt11 = bolt11
+            };
+            string jsonBody = JsonConvert.SerializeObject(requestBody);
 
-            // Fallback: try direct deserialization
-            if (invoiceResponse == null)
+            var headers = new Dictionary<string, string>
             {
-                invoiceResponse = JsonConvert.DeserializeObject<InvoiceResponse>(response);
-            }
+                { "X-Api-Key", config.ApiKey },
+                { "Content-Type", "application/json" }
+            };
 
-            string paymentHash = invoiceResponse != null ? invoiceResponse.PaymentHash : null;
-
-            if (!string.IsNullOrEmpty(paymentHash))
+            MakeWebRequest(url, jsonBody, (code, response) =>
             {
-                callback(true, paymentHash);
-            }
-            else
+                if (code != 200 && code != 201)
+                {
+                    PrintError($"Error processing payment: HTTP {code}");
+                    callback(false, null);
+                    return;
+                }
+
+                try
+                {
+                    InvoiceResponse invoiceResponse = null;
+                    // First, attempt to deserialize using the wrapper (if present)
+                    try
+                    {
+                        var wrapper = JsonConvert.DeserializeObject<InvoiceResponseWrapper>(response);
+                        invoiceResponse = wrapper?.Data;
+                    }
+                    catch { }
+
+                    // Fallback: try direct deserialization
+                    if (invoiceResponse == null)
+                    {
+                        invoiceResponse = JsonConvert.DeserializeObject<InvoiceResponse>(response);
+                    }
+
+                    string paymentHash = invoiceResponse != null ? invoiceResponse.PaymentHash : null;
+
+                    if (!string.IsNullOrEmpty(paymentHash))
+                    {
+                        callback(true, paymentHash);
+                    }
+                    else
+                    {
+                        PrintError("Payment hash (rhash) is missing or invalid in the response.");
+                        PrintWarning($"[SendPayment] Raw response: {response}");
+                        callback(false, null);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    PrintError($"Exception occurred while parsing payment response: {ex.Message}");
+                    callback(false, null);
+                }
+            }, RequestMethod.POST, headers);
+        }
+
+        // CreateInvoice now properly handles the wrapper class
+        private void CreateInvoice(int amountSats, string memo, Action<InvoiceResponse> callback)
+        {
+            string url = $"{config.BaseUrl}/api/v1/payments";
+
+            var requestBody = new
             {
-                PrintError("Payment hash (rhash) is missing or invalid in the response.");
-                PrintWarning($"[SendPayment] Raw response: {response}");
-                callback(false, null);
-            }
+                @out = false,
+                amount = amountSats,
+                memo = memo
+            };
+            string jsonBody = JsonConvert.SerializeObject(requestBody);
+
+            var headers = new Dictionary<string, string>
+            {
+                { "X-Api-Key", config.ApiKey },
+                { "Content-Type", "application/json" }
+            };
+
+            MakeWebRequest(url, jsonBody, (code, response) =>
+            {
+                if (code != 200 && code != 201)
+                {
+                    PrintError($"Error creating invoice: HTTP {code}");
+                    callback(null);
+                    return;
+                }
+
+                if (string.IsNullOrEmpty(response))
+                {
+                    PrintError("Empty response received when creating invoice.");
+                    callback(null);
+                    return;
+                }
+
+                // Log the raw response for debugging purposes.
+                PrintWarning($"[CreateInvoice] Raw response: {response}");
+
+                try
+                {
+                    var invoiceResponse = JsonConvert.DeserializeObject<InvoiceResponse>(response);
+                    callback(invoiceResponse != null && !string.IsNullOrEmpty(invoiceResponse.PaymentHash) ? invoiceResponse : null);
+                }
+                catch (Exception ex)
+                {
+                    PrintError($"Failed to deserialize invoice response: {ex.Message}");
+                    callback(null);
+                }
+            }, RequestMethod.POST, headers);
         }
-        catch (Exception ex)
-        {
-            PrintError($"Exception occurred while parsing payment response: {ex.Message}");
-            callback(false, null);
-        }
-    }, RequestMethod.POST, headers);
-}
-
-
-        // UPDATED: CreateInvoice now deserializes using the wrapper class
-private void CreateInvoice(int amountSats, string memo, Action<InvoiceResponse> callback)
-{
-    string url = $"{config.BaseUrl}/api/v1/payments";
-
-    var requestBody = new
-    {
-        @out = false,
-        amount = amountSats,
-        memo = memo
-    };
-    string jsonBody = JsonConvert.SerializeObject(requestBody);
-
-    var headers = new Dictionary<string, string>
-    {
-        { "X-Api-Key", config.ApiKey },
-        { "Content-Type", "application/json" }
-    };
-
-    MakeWebRequest(url, jsonBody, (code, response) =>
-    {
-        if (code != 200 && code != 201)
-        {
-            PrintError($"Error creating invoice: HTTP {code}");
-            callback(null);
-            return;
-        }
-
-        if (string.IsNullOrEmpty(response))
-        {
-            PrintError("Empty response received when creating invoice.");
-            callback(null);
-            return;
-        }
-
-        // Log the raw response for debugging purposes.
-        PrintWarning($"[CreateInvoice] Raw response: {response}");
-
-        try
-        {
-            var invoiceResponse = JsonConvert.DeserializeObject<InvoiceResponse>(response);
-            callback(invoiceResponse != null && !string.IsNullOrEmpty(invoiceResponse.PaymentHash) ? invoiceResponse : null);
-        }
-        catch (Exception ex)
-        {
-            PrintError($"Failed to deserialize invoice response: {ex.Message}");
-            callback(null);
-        }
-    }, RequestMethod.POST, headers);
-}
 
         private string GetPlayerId(IPlayer player)
         {
@@ -1237,44 +2111,92 @@ private void CreateInvoice(int amountSats, string memo, Action<InvoiceResponse> 
             return parts.Length == 2 ? parts[1] : "unknown@unknown.com";
         }
 
-        // NEW: RewardPlayer method to grant currency items to the player
+        // RewardPlayer method to grant currency items to the player
         private void RewardPlayer(IPlayer player, int amount)
         {
-            player.Reply($"You have successfully purchased {amount} {currencyName}!");
-
             var basePlayer = player.Object as BasePlayer;
-            if (basePlayer != null)
+            if (basePlayer == null)
             {
-                var currencyItem = ItemManager.CreateByItemID(currencyItemID, amount);
-                if (currencyItem != null)
+                PrintError($"Failed to find base player object for player {player.Id}.");
+                return;
+            }
+
+            var currencyItem = ItemManager.CreateByItemID(currencyItemID, amount);
+            if (currencyItem != null)
+            {
+                if (currencySkinID > 0)
                 {
-                    if (currencySkinID > 0)
-                    {
-                        currencyItem.skin = currencySkinID;
-                    }
+                    currencyItem.skin = currencySkinID;
+                }
+                
+                // Check if player has inventory space first
+                if (HasInventorySpace(basePlayer, amount))
+                {
+                    // Give the item to the player
                     basePlayer.GiveItem(currencyItem);
+                    player.Reply($"You have successfully purchased {amount} {currencyName}!");
                     Puts($"Gave {amount} {currencyName} (skinID: {currencySkinID}) to player {basePlayer.UserIDString}.");
                 }
                 else
                 {
-                    PrintError($"Failed to create {currencyName} item for player {basePlayer.UserIDString}.");
+                    // Drop on ground if no inventory space
+                    var dropPosition = basePlayer.transform.position + new UnityEngine.Vector3(0f, 1.5f, 0f);
+                    var droppedItemEntity = currencyItem.CreateWorldObject(dropPosition);
+                    
+                    if (droppedItemEntity != null)
+                    {
+                        player.Reply($"Your inventory was full! {amount} {currencyName} dropped on the ground near you.");
+                        Puts($"Dropped {amount} {currencyName} on ground for player {basePlayer.UserIDString} (inventory full).");
+                    }
+                    else
+                    {
+                        currencyItem.Remove();
+                        PrintError($"Failed to drop {currencyName} item for player {basePlayer.UserIDString}.");
+                        player.Reply($"Your inventory was full and we couldn't drop the items. Please contact an administrator.");
+                    }
                 }
             }
             else
             {
-                PrintError($"Failed to find base player object for player {player.Id}.");
+                PrintError($"Failed to create {currencyName} item for player {basePlayer.UserIDString}.");
             }
         }
 
-        // NEW: GrantVip method to add the VIP permission group to the player
+        // GrantVip method to add the VIP permission group to the player
         private void GrantVip(IPlayer player)
         {
             player.Reply("You have successfully purchased VIP status!");
-            permission.AddUserGroup(player.Id, vipPermissionGroup);
-            Puts($"Player {GetPlayerId(player)} added to VIP group '{vipPermissionGroup}'.");
+            
+            var basePlayer = player.Object as BasePlayer;
+            if (basePlayer == null)
+            {
+                PrintError($"Failed to find base player object for player {player.Id} to grant VIP.");
+                return;
+            }
+            
+            // Replace placeholders in the command
+            string commandToExecute = vipCommand
+                .Replace("{player}", player.Name)
+                .Replace("{steamid}", GetPlayerId(player))
+                .Replace("{userid}", GetPlayerId(player))
+                .Replace("{id}", GetPlayerId(player));
+            
+            Puts($"[VIP] Executing command for player {player.Name} ({GetPlayerId(player)}): {commandToExecute}");
+            
+            try
+            {
+                // Execute the command on the server using the correct Covalence method
+                server.Command(commandToExecute);
+                Puts($"[VIP] Successfully executed VIP command for player {player.Name}");
+            }
+            catch (Exception ex)
+            {
+                PrintError($"[VIP] Failed to execute VIP command for player {player.Name}: {ex.Message}");
+                PrintError($"[VIP] Command was: {commandToExecute}");
+            }
         }
 
-        // NEW: ReturnCurrency method to refund currency items to the player
+        // Fixed ReturnCurrency method with inventory space checking
         private void ReturnCurrency(BasePlayer player, int amount)
         {
             var returnedCurrency = ItemManager.CreateByItemID(currencyItemID, amount);
@@ -1284,7 +2206,30 @@ private void CreateInvoice(int amountSats, string memo, Action<InvoiceResponse> 
                 {
                     returnedCurrency.skin = currencySkinID;
                 }
-                returnedCurrency.MoveToContainer(player.inventory.containerMain);
+                
+                // Check if player has inventory space first
+                if (HasInventorySpace(player, amount))
+                {
+                    // Move to main container
+                    returnedCurrency.MoveToContainer(player.inventory.containerMain);
+                    Puts($"Returned {amount} {currencyName} to player {player.UserIDString}.");
+                }
+                else
+                {
+                    // Drop on ground if no inventory space
+                    var dropPosition = player.transform.position + new UnityEngine.Vector3(0f, 1.5f, 0f);
+                    var droppedItemEntity = returnedCurrency.CreateWorldObject(dropPosition);
+                    
+                    if (droppedItemEntity != null)
+                    {
+                        Puts($"Dropped {amount} {currencyName} on ground for player {player.UserIDString} (inventory full).");
+                    }
+                    else
+                    {
+                        returnedCurrency.Remove();
+                        PrintError($"Failed to return or drop {amount} {currencyName} for player {player.UserIDString}.");
+                    }
+                }
             }
             else
             {
@@ -1292,13 +2237,109 @@ private void CreateInvoice(int amountSats, string memo, Action<InvoiceResponse> 
             }
         }
 
-        // NEW: LogSellTransaction helper
+        // Helper method to check if player has inventory space
+        private bool HasInventorySpace(BasePlayer player, int amount)
+        {
+            if (player?.inventory?.containerMain == null)
+                return false;
+
+            int availableSpace = 0;
+            var container = player.inventory.containerMain;
+            
+            // Check each slot in main inventory
+            for (int i = 0; i < container.capacity; i++)
+            {
+                var slot = container.GetSlot(i);
+                if (slot == null)
+                {
+                    // Empty slot - can fit full stack
+                    var itemDefinition = ItemManager.FindItemDefinition(currencyItemID);
+                    if (itemDefinition != null)
+                    {
+                        availableSpace += itemDefinition.stackable;
+                    }
+                }
+                else if (IsCurrencyItem(slot))
+                {
+                    int maxStack = slot.info.stackable;
+                    if (slot.amount < maxStack)
+                    {
+                        // Existing currency stack with room
+                        availableSpace += maxStack - slot.amount;
+                    }
+                }
+                
+                // If we have enough space, no need to check further
+                if (availableSpace >= amount)
+                    return true;
+            }
+            
+            return availableSpace >= amount;
+        }
+
+        // LOGGING METHODS
+
+        // Enhanced LogSellTransaction helper
         private void LogSellTransaction(SellInvoiceLogEntry logEntry)
         {
             var logs = LoadSellLogData();
-            logs.Add(logEntry);
+            
+            // Check if this is an update to existing transaction
+            var existingIndex = logs.FindIndex(l => l.TransactionId == logEntry.TransactionId);
+            if (existingIndex >= 0)
+            {
+                // Update existing entry
+                logs[existingIndex] = logEntry;
+                Puts($"[Orangemart] Updated sell transaction: {logEntry.TransactionId}");
+            }
+            else
+            {
+                // Add new entry
+                logs.Add(logEntry);
+                Puts($"[Orangemart] Logged new sell transaction: {logEntry.TransactionId}");
+            }
+            
             SaveSellLogData(logs);
-            Puts($"[Orangemart] Logged sell transaction: {JsonConvert.SerializeObject(logEntry)}");
+        }
+
+        // Update sell transaction status
+        private void UpdateSellTransactionStatus(string transactionId, string status, bool success, string failureReason = null, bool currencyReturned = false)
+        {
+            var logs = LoadSellLogData();
+            var entry = logs.FirstOrDefault(l => l.TransactionId == transactionId);
+            
+            if (entry != null)
+            {
+                entry.Status = status;
+                entry.Success = success;
+                entry.CompletedTimestamp = DateTime.UtcNow;
+                entry.CurrencyReturned = currencyReturned;
+                if (!string.IsNullOrEmpty(failureReason))
+                {
+                    entry.FailureReason = failureReason;
+                }
+                
+                SaveSellLogData(logs);
+                Puts($"[Orangemart] Updated sell transaction status: {transactionId} -> {status}");
+            }
+            else
+            {
+                PrintWarning($"[Orangemart] Could not find sell transaction to update: {transactionId}");
+            }
+        }
+
+        // Update sell transaction with payment hash
+        private void UpdateSellTransactionPaymentHash(string transactionId, string paymentHash)
+        {
+            var logs = LoadSellLogData();
+            var entry = logs.FirstOrDefault(l => l.TransactionId == transactionId);
+            
+            if (entry != null)
+            {
+                entry.PaymentHash = paymentHash;
+                SaveSellLogData(logs);
+                Puts($"[Orangemart] Updated sell transaction with payment hash: {transactionId}");
+            }
         }
 
         private List<SellInvoiceLogEntry> LoadSellLogData()
@@ -1319,35 +2360,110 @@ private void CreateInvoice(int amountSats, string memo, Action<InvoiceResponse> 
             File.WriteAllText(path, JsonConvert.SerializeObject(data, Formatting.Indented));
         }
 
-        // NEW: LogBuyInvoice helper
+        // Enhanced LogBuyInvoice helper
         private void LogBuyInvoice(BuyInvoiceLogEntry logEntry)
         {
-            var logPath = Path.Combine(Interface.Oxide.DataDirectory, BuyInvoiceLogFile);
-            var directory = Path.GetDirectoryName(logPath);
+            var logs = LoadBuyLogData();
+            
+            // Check if this is an update to existing transaction
+            var existingIndex = logs.FindIndex(l => l.TransactionId == logEntry.TransactionId);
+            if (existingIndex >= 0)
+            {
+                // Update existing entry
+                logs[existingIndex] = logEntry;
+                Puts($"[Orangemart] Updated buy transaction: {logEntry.TransactionId}");
+            }
+            else
+            {
+                // Add new entry
+                logs.Add(logEntry);
+                Puts($"[Orangemart] Logged new buy transaction: {logEntry.TransactionId}");
+            }
+            
+            SaveBuyLogData(logs);
+        }
+
+        // Update buy transaction status
+        private void UpdateBuyTransactionStatus(string transactionId, string status, bool isPaid)
+        {
+            var logs = LoadBuyLogData();
+            var entry = logs.FirstOrDefault(l => l.TransactionId == transactionId);
+            
+            if (entry != null)
+            {
+                entry.Status = status;
+                entry.IsPaid = isPaid;
+                entry.CompletedTimestamp = DateTime.UtcNow;
+                
+                if (isPaid)
+                {
+                    if (entry.PurchaseType == "Currency")
+                    {
+                        entry.CurrencyGiven = true;
+                    }
+                    else if (entry.PurchaseType == "VIP")
+                    {
+                        entry.VipGranted = true;
+                    }
+                }
+                
+                SaveBuyLogData(logs);
+                Puts($"[Orangemart] Updated buy transaction status: {transactionId} -> {status}");
+            }
+            else
+            {
+                PrintWarning($"[Orangemart] Could not find buy transaction to update: {transactionId}");
+            }
+        }
+
+        // Update buy transaction with invoice ID
+        private void UpdateBuyTransactionInvoiceId(string transactionId, string invoiceId)
+        {
+            var logs = LoadBuyLogData();
+            var entry = logs.FirstOrDefault(l => l.TransactionId == transactionId);
+            
+            if (entry != null)
+            {
+                entry.InvoiceID = invoiceId;
+                SaveBuyLogData(logs);
+                Puts($"[Orangemart] Updated buy transaction with invoice ID: {transactionId}");
+            }
+        }
+
+        private List<BuyInvoiceLogEntry> LoadBuyLogData()
+        {
+            var path = Path.Combine(Interface.Oxide.DataDirectory, BuyInvoiceLogFile);
+            return File.Exists(path)
+                ? JsonConvert.DeserializeObject<List<BuyInvoiceLogEntry>>(File.ReadAllText(path)) ?? new List<BuyInvoiceLogEntry>()
+                : new List<BuyInvoiceLogEntry>();
+        }
+
+        private void SaveBuyLogData(List<BuyInvoiceLogEntry> data)
+        {
+            var path = Path.Combine(Interface.Oxide.DataDirectory, BuyInvoiceLogFile);
+            var directory = Path.GetDirectoryName(path);
             if (!Directory.Exists(directory))
                 Directory.CreateDirectory(directory);
 
-            List<BuyInvoiceLogEntry> invoiceLogs = File.Exists(logPath)
-                ? JsonConvert.DeserializeObject<List<BuyInvoiceLogEntry>>(File.ReadAllText(logPath)) ?? new List<BuyInvoiceLogEntry>()
-                : new List<BuyInvoiceLogEntry>();
-
-            invoiceLogs.Add(logEntry);
-            File.WriteAllText(logPath, JsonConvert.SerializeObject(invoiceLogs, Formatting.Indented));
-            Puts($"[Orangemart] Logged buy invoice: {JsonConvert.SerializeObject(logEntry)}");
+            File.WriteAllText(path, JsonConvert.SerializeObject(data, Formatting.Indented));
         }
 
         private BuyInvoiceLogEntry CreateBuyInvoiceLogEntry(IPlayer player, string invoiceID, bool isPaid, int amount, PurchaseType type, int retryCount)
         {
             return new BuyInvoiceLogEntry
             {
+                TransactionId = GenerateTransactionId(),
                 SteamID = GetPlayerId(player),
                 InvoiceID = invoiceID,
+                Status = isPaid ? TransactionStatus.COMPLETED : TransactionStatus.FAILED,
                 IsPaid = isPaid,
                 Timestamp = DateTime.UtcNow,
-                Amount = type == PurchaseType.SendBitcoin ? amount : amount * pricePerCurrencyUnit,
+                CompletedTimestamp = DateTime.UtcNow,
+                Amount = amount,
                 CurrencyGiven = isPaid && type == PurchaseType.Currency,
                 VipGranted = isPaid && type == PurchaseType.Vip,
-                RetryCount = retryCount
+                RetryCount = retryCount,
+                PurchaseType = type == PurchaseType.Currency ? "Currency" : "VIP"
             };
         }
 
