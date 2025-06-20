@@ -62,6 +62,18 @@ These settings allow you to tailor the plugin's behavior to fit your server's re
 - **`PricePerCurrencyUnit`**
   - The price (in satoshis) per unit of in-game currency.
 
+- **`MaxPurchaseAmount`**
+  - Maximum number of currency units a player can buy in one invoice. Set to 0 for no limit.
+
+- **`MaxSendAmount`**
+  - Maximum number of currency units a player can send in one transaction. Set to 0 for no limit.
+
+- **`CommandCooldownSeconds`**
+  - How many seconds a player must wait between repeat uses of any Orangemart command. Set to 0 to disable cooldowns.
+
+- **`MaxPendingInvoicesPerPlayer`**
+  - How many outstanding (unpaid) invoices a single player can have at once. Set to 0 for no limit.
+
 #### Discord Integration
 
 - **`DiscordChannelName`**
@@ -93,12 +105,18 @@ These settings allow you to tailor the plugin's behavior to fit your server's re
 - **`MaxRetries`**
   - The maximum number of retry attempts for checking invoice payments before considering them expired.
 
+- **`UseWebSockets`**
+  - Set true to enable WS-based invoice updates; false to always fall back to HTTP.
+
+- **`WebSocketReconnectDelay`**
+  - How many seconds to wait before retrying a failed WebSocket connection. 
+
 #### VIP Settings
 
 Configure the VIP status purchase and permissions.
 
-- **`VipPermissionGroup`**
-  - The Oxide permission group that players are added to upon purchasing VIP status.
+- **`VipCommand`**
+  - The Oxide console command template to grant VIP status.
 
 - **`VipPrice`**
   - The price (in satoshis) for players to purchase VIP status.
@@ -121,7 +139,11 @@ Here's how the configuration might look in your `config.json`:
     "CurrencyName": "blood",
     "CurrencySkinID": 0,
     "PricePerCurrencyUnit": 1,
-    "SatsPerCurrencyUnit": 1
+    "SatsPerCurrencyUnit": 1,
+    "MaxPurchaseAmount": 10000,
+    "MaxSendAmount": 10000,
+    "CommandCooldownSeconds": 0,
+    "MaxPendingInvoicesPerPlayer": 1
   },
   "Discord": {
     "DiscordChannelName": "mart",
@@ -134,10 +156,12 @@ Here's how the configuration might look in your `config.json`:
     "InvoiceTimeoutSeconds": 300,
     "LNbitsApiKey": "your-lnbits-admin-api-key",
     "LNbitsBaseUrl": "https://your-lnbits-instance.com",
-    "MaxRetries": 25
+    "MaxRetries": 25,
+    "UseWebSockets": true,
+    "WebSocketReconnectDelay": 5
   },
   "VIPSettings": {
-    "VipPermissionGroup": "vip",
+    "VipCommand": "oxide.usergroup add {player} vip",
     "VipPrice": 1000
   }
 }
